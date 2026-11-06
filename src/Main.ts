@@ -5,9 +5,9 @@ import { ChunkManager } from "./world/ChunkManager";
 import { NavGrid } from "./world/NavGrid";
 import { PathService, Vec2 } from "./world/PathFinder";
 import { SpawnRegistry } from "./world/Spawns";
-import { CELL, CHUNK_SIZE, chopResult } from "./world/WorldConfig";
+import { CELL, CHUNK_CELLS, CHUNK_SIZE, chopResult } from "./world/WorldConfig";
 import { loadWaterShader } from "./world/WaterShader";
-import { groundY, roadNode } from "./world/WorldGen";
+import { groundY, spawnPoint } from "./world/WorldGen";
 
 const { regClass } = Laya;
 
@@ -75,8 +75,8 @@ export class Main extends Laya.Script {
         this.chunks.onChunkUnloaded = (cx, cz) => this.monsters.despawnForChunk(cx, cz);
         this.nav.onCellChanged = (cx, cz, gx, gz) => this.onCellChanged(cx, cz, gx, gz);
 
-        // 出生在块 (0,0) 的道路节点上，保证在连通区域内
-        const start = roadNode(0, 0);
+        // 出生在大区 (0,0) 的主干道交汇处
+        const start = spawnPoint();
         this.player = new Player(this.scene3D, { x: (start.gx + 0.5) * CELL, z: (start.gz + 0.5) * CELL }, this.nav);
         this.chunks.warmUp(this.player.pos.x, this.player.pos.z);
 
@@ -230,6 +230,12 @@ export class Main extends Laya.Script {
     /** 格子变化时：重建画面；如果有格子变成阻挡，让正在走的单位重新寻路 */
     private onCellChanged(cx: number, cz: number, gx: number, gz: number) {
         this.chunks.rebuild(cx, cz);
+        // 地面过渡会读相邻块边缘的格子，块边上的格子变化时邻块也要重建
+        const lx = gx - cx * CHUNK_CELLS, lz = gz - cz * CHUNK_CELLS;
+        if (lx === 0) this.chunks.rebuild(cx - 1, cz);
+        if (lx === CHUNK_CELLS - 1) this.chunks.rebuild(cx + 1, cz);
+        if (lz === 0) this.chunks.rebuild(cx, cz - 1);
+        if (lz === CHUNK_CELLS - 1) this.chunks.rebuild(cx, cz + 1);
         this.minimap.invalidate(cx, cz);
         if (this.nav.walkable(gx, gz)) return;   // 只是多了一条路，旧路径仍然有效
         const p = this.player;

@@ -18,9 +18,9 @@ export function createWaterMaterial(): Laya.Material {
     const mat = new Laya.Material();
     mat.setShaderName(WATER_SHADER_NAME);
     mat.materialRenderMode = Laya.MaterialRenderMode.RENDERMODE_TRANSPARENT;
-    mat.setColor("u_ShallowColor", new Laya.Color(0.28, 0.72, 0.78, 0.55));
-    mat.setColor("u_DeepColor", new Laya.Color(0.07, 0.30, 0.55, 0.92));
-    mat.setColor("u_SkyColor", new Laya.Color(0.70, 0.84, 0.96, 1));
+    mat.setColor("u_ShallowColor", new Laya.Color(0.25, 0.65, 0.72, 0.45));
+    mat.setColor("u_DeepColor", new Laya.Color(0.06, 0.26, 0.50, 0.88));
+    mat.setColor("u_SkyColor", new Laya.Color(0.72, 0.85, 0.95, 1));
     mat.setVector3("u_SunDir", new Laya.Vector3(-0.4, 0.8, 0.45));
     return mat;
 }

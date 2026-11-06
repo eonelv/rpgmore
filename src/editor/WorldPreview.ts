@@ -1,6 +1,6 @@
 import { buildChunkMeshes, buildWaterMesh, createWorldMaterials } from "../world/ChunkRenderer";
 import { CELL, CHUNK_SIZE } from "../world/WorldConfig";
-import { groundY, roadNode } from "../world/WorldGen";
+import { groundY, spawnPoint } from "../world/WorldGen";
 import { editorNav } from "./EditorNav";
 
 const { regClass, property, runInEditor } = Laya;
@@ -64,10 +64,10 @@ export class WorldPreview extends Laya.Script {
         root.hideFlags = Laya.HideFlags.HideAndDontSave;
         for (let cz = ccz - r; cz <= ccz + r; cz++) {
             for (let cx = ccx - r; cx <= ccx + r; cx++) {
-                for (const m of buildChunkMeshes(editorNav().getChunk(cx, cz))) {
-                    this.meshes.push(m);
-                    const ms = new Laya.MeshSprite3D(m);
-                    ms.meshRenderer.sharedMaterial = this.mats.terrain;
+                for (const p of buildChunkMeshes(editorNav().getChunk(cx, cz), (gx, gz) => editorNav().kind(gx, gz))) {
+                    this.meshes.push(p.mesh);
+                    const ms = new Laya.MeshSprite3D(p.mesh);
+                    ms.meshRenderer.sharedMaterial = this.mats.terrain[p.layer];
                     root.addChild(ms);
                 }
                 const wm = buildWaterMesh(cx, cz);
@@ -80,8 +80,8 @@ export class WorldPreview extends Laya.Script {
             }
         }
 
-        // 出生点标记（与 Main 里的出生逻辑一致：块 (0,0) 的道路节点）
-        const start = roadNode(0, 0);
+        // 出生点标记（与 Main 里的出生逻辑一致：spawnPoint）
+        const start = spawnPoint();
         const sx = (start.gx + 0.5) * CELL, sz = (start.gz + 0.5) * CELL, sy = groundY(sx, sz);
         const lines = new Laya.PixelLineSprite3D(4);
         const yellow = new Laya.Color(1, 0.9, 0.1, 1);

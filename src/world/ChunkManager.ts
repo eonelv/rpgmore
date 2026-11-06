@@ -1,4 +1,4 @@
-import { buildChunkMeshes, buildWaterMesh, createWorldMaterials } from "./ChunkRenderer";
+import { TerrainLayer, buildChunkMeshes, buildWaterMesh, createWorldMaterials } from "./ChunkRenderer";
 import { NavGrid } from "./NavGrid";
 import { CHUNK_SIZE, LOAD_RADIUS, UNLOAD_RADIUS, chunkKey } from "./WorldConfig";
 
@@ -23,7 +23,7 @@ export class ChunkManager {
     private queued = new Set<number>();
     private lastCx = NaN;
     private lastCz = NaN;
-    private terrainMat: Laya.BlinnPhongMaterial;
+    private terrainMat: Record<TerrainLayer, Laya.BlinnPhongMaterial>;
     private waterMat: Laya.Material;
 
     /** 块加载/卸载的回调，用于生成/回收怪物 */
@@ -112,10 +112,11 @@ export class ChunkManager {
     }
 
     private buildTerrain(c: LoadedChunk) {
-        c.meshes = buildChunkMeshes(this.nav.getChunk(c.cx, c.cz));
-        c.terrain = c.meshes.map(m => {
-            const ms = new Laya.MeshSprite3D(m);
-            ms.meshRenderer.sharedMaterial = this.terrainMat;
+        const parts = buildChunkMeshes(this.nav.getChunk(c.cx, c.cz), (gx, gz) => this.nav.kind(gx, gz));
+        c.meshes = parts.map(p => p.mesh);
+        c.terrain = parts.map(p => {
+            const ms = new Laya.MeshSprite3D(p.mesh);
+            ms.meshRenderer.sharedMaterial = this.terrainMat[p.layer];
             c.root.addChild(ms);
             return ms;
         });

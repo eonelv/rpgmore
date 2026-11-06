@@ -1,14 +1,14 @@
 import { NavGrid } from "./NavGrid";
 import { CELL, CHUNK_CELLS } from "./WorldConfig";
-import { roadNode } from "./WorldGen";
 
 /**
  * 分层 + 分帧的格子 A*。
  *
- * 低层：8 方向 A*，禁止斜穿墙角。搜索范围限制在“起点块与终点块围成的矩形 + 1 块边距”内。
- *       世界生成保证矩形内一定有通路，所以限制范围不会导致找不到路。
+ * 低层：8 方向 A*，禁止斜穿墙角。搜索范围限制在“起点块与终点块围成的矩形 + MARGIN 块边距”内。
+ *       世界不保证处处连通（大湖、山脉），范围内到不了目标时，返回到离目标最近的已探索格子的路径
+ *       （reached=false），单位会走到湖边/山脚停下。
  * 高层：目标超过 MAX_SPAN 块时，先在块网格上朝目标走 MAX_SPAN 块，
- *       以那块的道路节点作为中间目标。到达后再规划下一段（返回 partial=true）。
+ *       以那块中心附近的可走格子作为中间目标。到达后再规划下一段（返回 partial=true）。
  * 分帧：每个请求每次 step() 最多展开固定数量的节点，PathService 按每帧时间预算推进队列。
  */
 
@@ -20,10 +20,14 @@ export interface PathResult {
     points: Vec2[];
     /** true 表示这只是去往远处目标的一段，到达后需要继续请求 */
     partial: boolean;
+    /** false 表示到不了目标，路径只通往离目标最近的可达位置 */
+    reached: boolean;
     expanded: number;
 }
 
 const MAX_SPAN = 3;
+/** 搜索范围在起点/终点块矩形外扩的块数（给绕湖、绕山留空间） */
+const MARGIN = 2;
 const SQRT2 = Math.SQRT2;
 const DIRS = [
     [1, 0, 1], [-1, 0, 1], [0, 1, 1], [0, -1, 1],
@@ -79,6 +83,9 @@ export class PathRequest {
     private open = new MinHeap();
     private sx = 0; private sz = 0; private tx = 0; private tz = 0;
     private partial = false;
+    /** 已关闭节点中启发值最小的（离目标最近），找不到路时用它 */
+    private bestNode = -1;
+    private bestH = Infinity;
     private expanded = 0;
     private startWorld: Vec2;
 
@@ -99,18 +106,18 @@ export class PathRequest {
             const k = MAX_SPAN / Math.max(Math.abs(dx), Math.abs(dz));
             tcx = scx + Math.round(dx * k);
             tcz = scz + Math.round(dz * k);
-            const rn = roadNode(tcx, tcz);
-            tgx = rn.gx; tgz = rn.gz;
+            tgx = tcx * CHUNK_CELLS + (CHUNK_CELLS >> 1); tgz = tcz * CHUNK_CELLS + (CHUNK_CELLS >> 1);
+            const t = nav.nearestWalkable(tgx, tgz, 12);
+            if (t) { tgx = t.gx; tgz = t.gz; }
             this.partial = true;
         } else {
             const t = nav.nearestWalkable(tgx, tgz, 6);
-            if (!t) { this.finish(false, []); return; }
-            tgx = t.gx; tgz = t.gz;
+            if (t) { tgx = t.gx; tgz = t.gz; }   // 附近没有可走格子时仍以原点为目标，走到最近处
         }
 
-        // 搜索范围：两块围成的矩形 + 1 块边距
-        const minCx = Math.min(scx, tcx) - 1, maxCx = Math.max(scx, tcx) + 1;
-        const minCz = Math.min(scz, tcz) - 1, maxCz = Math.max(scz, tcz) + 1;
+        // 搜索范围：两块围成的矩形 + MARGIN 块边距
+        const minCx = Math.min(scx, tcx) - MARGIN, maxCx = Math.max(scx, tcx) + MARGIN;
+        const minCz = Math.min(scz, tcz) - MARGIN, maxCz = Math.max(scz, tcz) + MARGIN;
         this.ox = minCx * CHUNK_CELLS; this.oz = minCz * CHUNK_CELLS;
         this.w = (maxCx - minCx + 1) * CHUNK_CELLS; this.h = (maxCz - minCz + 1) * CHUNK_CELLS;
         const n = this.w * this.h;
@@ -147,13 +154,21 @@ export class PathRequest {
         if (this.cancelled) { this.done = true; return true; }
         const w = this.w;
         while (budget-- > 0) {
-            if (this.open.size === 0) { this.finish(false, []); return true; }
+            if (this.open.size === 0) {
+                // 到不了目标：走到离目标最近的位置（就在起点时视为失败）
+                const ok = this.bestNode >= 0 && this.bestNode !== this.sz * w + this.sx;
+                this.partial = false;
+                this.finish(ok, ok ? this.reconstruct(this.bestNode) : [], false);
+                return true;
+            }
             const cur = this.open.pop();
             if (this.state[cur] === 2) continue;
             this.state[cur] = 2;
             this.expanded++;
             const cx = cur % w, cz = (cur / w) | 0;
             if (cx === this.tx && cz === this.tz) { this.finish(true, this.reconstruct(cur)); return true; }
+            const hc = this.heuristic(cx, cz);
+            if (hc < this.bestH) { this.bestH = hc; this.bestNode = cur; }
             const gc = this.g[cur];
             for (const [dx, dz, cost] of DIRS) {
                 const nx = cx + dx, nz = cz + dz;
@@ -199,9 +214,9 @@ export class PathRequest {
         return out;
     }
 
-    private finish(ok: boolean, points: Vec2[]) {
+    private finish(ok: boolean, points: Vec2[], reached = ok) {
         this.done = true;
-        this.result = { ok, points, partial: this.partial, expanded: this.expanded };
+        this.result = { ok, points, partial: this.partial, reached, expanded: this.expanded };
         this.g = null!; this.parent = null!; this.state = null!;
         if (!this.cancelled) this.onDone(this.result);
     }
