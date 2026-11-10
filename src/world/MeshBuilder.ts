@@ -131,12 +131,18 @@ export class MeshBuilder {
      * 更圆润、可拉伸的低多边形石头（不画底面，底部埋进地里）。
      * 3 圈顶点 + 顶点，相邻两圈错开半格，形成三角切面；截面是椭圆 (rx, rz)，绕 y 轴转 rot。
      * bulge：中圈相对底圈的鼓出程度（>1 是圆鼓的大石头，<1 是往上收的石柱）；
-     * moss：顶部的苔藓颜色（不传则没有苔藓）
+     * moss：顶部的苔藓颜色（不传则没有苔藓）；
+     * seg：每圈顶点数，大石头用多一些；seg > 8 时多加一圈，顶部更圆，不会是尖锥
      */
     rock(x: number, y0: number, z: number, rx: number, rz: number, h: number, rot: number, col: RGB,
-        rand: (i: number) => number, bulge = 1, moss?: RGB) {
-        const SEG = 7;
-        const levels = [
+        rand: (i: number) => number, bulge = 1, moss?: RGB, seg = 7) {
+        const SEG = seg;
+        const levels = seg > 8 ? [
+            { y: -0.2, r: 1.0 },
+            { y: 0.38, r: bulge },
+            { y: 0.72, r: 0.78 * bulge },
+            { y: 0.93, r: 0.42 * bulge },
+        ] : [
             { y: -0.2, r: 1.0 },
             { y: 0.45, r: bulge },
             { y: 0.85, r: 0.55 * bulge },

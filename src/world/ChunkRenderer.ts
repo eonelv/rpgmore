@@ -1,4 +1,4 @@
-import { hash2 } from "./Noise";
+import { hash2, fbm } from "./Noise";
 import { createWaterMaterial } from "./WaterShader";
 import { MeshBuilder, RGB } from "./MeshBuilder";
 import {
@@ -82,14 +82,15 @@ function shade(c: RGB, f: number): RGB {
  * - sand：沙地，沙地贴图 × 顶点色（alpha 测试过渡）
  * - trail：山路，砂石贴图（alpha 测试裁出路边），按到山路中心线的距离画成连续的带子，盖在草地层上面
  * - plank：桥面，木板贴图 × 顶点色
- * - granite / strata：散落的石头（Cell.Rock）和它们下面的地面，花岗岩 / 层状砂岩贴图，法线投影 UV
+ * - granite / strata：散落的石头（Cell.Rock），花岗岩 / 层状砂岩贴图，法线投影 UV；
+ *   石头格子的地面是草地，不再单独铺一层石头底图
  */
 export type TerrainLayer = "base" | "grass" | "sand" | "plank" | "rock" | "gravel" | "trail" | "granite" | "strata";
 export interface ChunkMesh { mesh: Laya.Mesh; layer: TerrainLayer }
 
 /** 地面用草地贴图的格子：草地以及长在草地上的树、灌木、树桩 */
 function isGrassGround(kind: number): boolean {
-    return kind === Cell.Grass || kind === Cell.Tree || kind === Cell.Bush || kind === Cell.Stump;
+    return kind === Cell.Grass || kind === Cell.Tree || kind === Cell.Bush || kind === Cell.Stump || kind === Cell.Rock;
 }
 
 function isSandGround(kind: number): boolean {
@@ -176,6 +177,12 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
         while (n < 6 && isPath(kindAt(lx + dx * (n + 1), lz + dz * (n + 1)))) n++;
         return n;
     };
+    /** 按全局格子坐标查类型：本块和外面一圈用 K，再远的查相邻块 */
+    const kindG = (gx: number, gz: number) => {
+        const k = kindAt(gx - gx0, gz - gz0);
+        return k >= 0 ? k : kindGlobal(gx, gz);
+    };
+    const bigStones = new BigStoneCache(kindG);
 
     // 顶点数据（(N+1)x(N+1)），用世界坐标/全局格子计算，相邻块共享边缘，没有接缝
     // H：高度。挨着道路的顶点压平一点并且不低于可走高度（按顶点处理，路边和草地之间没有台阶缝）
@@ -254,7 +261,10 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
             if (kind === Cell.Mountain) {
                 col = shade(mountainRockColor(hAvg, slope, jitter), (0.94 + jitter * 0.12) * TEX_GAIN);
             } else if (isGrassGround(kind)) {
-                col = shade(COLORS[kind], (0.97 + jitter * 0.06) * TEX_GAIN);
+                // 石头格子的地面也是草地（石头长在草里），颜色用草地的，稍暗一点像被石头挡住了光
+                col = kind === Cell.Rock
+                    ? shade(COLORS[Cell.Grass], (0.88 + jitter * 0.06) * TEX_GAIN)
+                    : shade(COLORS[kind], (0.97 + jitter * 0.06) * TEX_GAIN);
             } else if (isSandGround(kind)) {
                 col = shade(COLORS[kind], (0.97 + jitter * 0.06) * TEX_GAIN);
             } else {
@@ -271,10 +281,6 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                     rockUV(lx, lz, h00, h10, h11, h01));
             } else if (kind === Cell.Road) {
                 gravelQuad(gravel, lx, lz, x0, z0, h00, h10, h11, h01, ref);
-            } else if (kind === Cell.Rock) {
-                // 石头下面的地面：花岗岩贴图，比石头本身暗一点（UV 自动从上往下投影）
-                granite.quad([x0, h00, z0], [x1, h10, z0], [x1, h11, z1], [x0, h01, z1],
-                    shade(GRANITE, 0.8 + jitter * 0.1), ref);
             } else if (!textured) {
                 mb.quad([x0, h00, z0], [x1, h10, z0], [x1, h11, z1], [x0, h01, z1], col, ref);
             } else {
@@ -348,9 +354,26 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                     }
                     break;
                 }
-                case Cell.Rock:
-                    stoneCell(granite, strata, gx, gz, cxw, baseY, czw, jitter);
+                case Cell.Rock: {
+                    // 大石头脚下的格子：大石头已经挡住了，不再放小石头（否则会从大石头里戳出来）
+                    const near = bigStones.cover(cxw, czw);
+                    if (near > 0) break;
+                    let rockN = 0;
+                    for (const [dx, dz] of NEIGHBORS8) if (kindAt(lx + dx, lz + dz) === Cell.Rock) rockN++;
+                    const hs = (k: number) => hash2(gx, gz, SEED + 4200 + k);
+                    // 石林里：约三成格子只有碎石（露出草地，石头之间有空隙），其余尺寸差别大
+                    // 零散的单块石头基本占满格子，保证看起来挡路
+                    const inField = rockN >= 3;
+                    const strataZone = stoneZone(cxw, czw);
+                    if (inField && hs(1) < 0.3) {
+                        pebbles(granite, strata, gx, gz, x0, z0, baseY, bigStones, strataZone, 2);
+                        break;
+                    }
+                    const scale = inField ? 0.5 + hs(0) * 0.55 : 0.85 + hs(0) * 0.2;
+                    stoneCell(granite, strata, gx, gz, cxw, baseY, czw, jitter, scale, stoneHeightScale(cxw, czw), strataZone);
+                    pebbles(granite, strata, gx, gz, x0, z0, baseY, bigStones, strataZone, 0);
                     break;
+                }
                 case Cell.Bush:
                     bushCell(mb, gx, gz, cxw, baseY, czw, jitter);
                     break;
@@ -365,6 +388,12 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                 }
             }
         }
+    }
+    // 大石头由中心所在的块来画（相邻块按同样的全局规则算出同一批大石头，不会重复也不会漏）
+    bigStones.ensure(gx0 * CELL, gz0 * CELL, (gx0 + N) * CELL, (gz0 + N) * CELL);
+    for (const s of bigStones.all()) {
+        const sgx = Math.floor(s.x / CELL), sgz = Math.floor(s.z / CELL);
+        if (sgx >= gx0 && sgx < gx0 + N && sgz >= gz0 && sgz < gz0 + N) drawBigStone(granite, strata, s);
     }
     const out: ChunkMesh[] = [];
     for (const m of mb.build()) out.push({ mesh: m, layer: "base" });
@@ -491,39 +520,44 @@ function blade(mb: MeshBuilder, bx: number, by: number, bz: number, tx: number, 
  * 一个石头格子（不可走）的模型，按格子哈希从几种造型里选一种：
  * 0 圆滚的大石头；1 一大两小的石堆；2 长苔藓的大石头（花岗岩）；
  * 3 叠起来的扁平石板；4 往上收的石柱（层状砂岩）。
- * 所有造型都基本占满格子，看起来挡路；朝向、尺寸、颜色都有随机变化
+ * 朝向、尺寸、颜色都有随机变化。scale 决定水平尺寸（1 = 基本占满格子），
+ * hScale 是这一带石头的整体高矮（石林里有的地方高耸、有的地方低矮）
  */
 function stoneCell(granite: MeshBuilder, strata: MeshBuilder, gx: number, gz: number,
-    x: number, y: number, z: number, jitter: number) {
+    x: number, y: number, z: number, jitter: number, scale = 1, hScale = 1, strataZone = 0.4) {
     const rnd = (k: number) => (i: number) => hash2(gx * 97 + i, gz * 89 + k, SEED + 4000);
     const h = (k: number) => hash2(gx, gz, SEED + 4100 + k);
-    const variant = Math.floor(h(0) * 5);
+    // 岩性按区域决定（一片灰色花岗岩、一片黄色砂岩），不再逐格随机混在一起
+    // 花岗岩：0 圆石 / 1 石堆 / 2 苔藓石（少）；砂岩：3 石板 / 4 石柱
+    const variant = h(0) < strataZone
+        ? (h(7) < 0.55 ? 3 : 4)
+        : (h(7) < 0.5 ? 0 : h(7) < 0.85 ? 1 : 2);
     const rot = h(1) * Math.PI * 2;
-    const R = CELL * 0.5;   // 格子半宽
+    const R = CELL * 0.5 * scale;   // 格子半宽
     const gcol = shade(GRANITE, 0.9 + jitter * 0.2);
     const scol = shade(STRATA, 0.9 + jitter * 0.2);
-    // 偏离格子中心一点
-    const ox = (h(2) - 0.5) * 0.3, oz = (h(3) - 0.5) * 0.3;
+    // 偏离格子中心一点（小石头偏得更多，避免一格一个中心）
+    const ox = (h(2) - 0.5) * (0.3 + 0.8 * (1 - scale)), oz = (h(3) - 0.5) * (0.3 + 0.8 * (1 - scale));
     switch (variant) {
         case 0: {
             const s = 0.85 + h(4) * 0.3;
-            granite.rock(x + ox, y, z + oz, R * 0.95 * s, R * (0.75 + h(5) * 0.2) * s, (1.3 + h(6) * 0.6) * s, rot, gcol, rnd(0), 1.08);
+            granite.rock(x + ox, y, z + oz, R * 0.95 * s, R * (0.75 + h(5) * 0.2) * s, (1.3 + h(6) * 0.6) * s * hScale, rot, gcol, rnd(0), 1.08);
             break;
         }
         case 1: {
-            granite.rock(x + ox, y, z + oz, R * 0.7, R * 0.6, 1.3 + h(4) * 0.4, rot, gcol, rnd(0), 1.05);
+            granite.rock(x + ox, y, z + oz, R * 0.7, R * 0.6, (1.3 + h(4) * 0.4) * hScale, rot, gcol, rnd(0), 1.05);
             for (let k = 0; k < 2; k++) {
                 const a = rot + k * 2.4 + h(10 + k);
                 const d = R * 0.6;
                 const s = 0.3 + h(12 + k) * 0.2;
-                granite.rock(x + Math.cos(a) * d, y, z + Math.sin(a) * d, R * s, R * s * 0.85, 0.7 * s * 2,
+                granite.rock(x + Math.cos(a) * d, y, z + Math.sin(a) * d, R * s, R * s * 0.85, 0.7 * s * 2 * hScale,
                     a, shade(gcol, 0.92 + h(14 + k) * 0.15), rnd(1 + k), 1.1);
             }
             break;
         }
         case 2: {
             const s = 0.9 + h(4) * 0.25;
-            granite.rock(x + ox, y, z + oz, R * 0.92 * s, R * 0.82 * s, (1.1 + h(5) * 0.4) * s, rot, gcol, rnd(0), 1.12,
+            granite.rock(x + ox, y, z + oz, R * 0.92 * s, R * 0.82 * s, (1.1 + h(5) * 0.4) * s * hScale, rot, gcol, rnd(0), 1.12,
                 shade(MOSS, 0.9 + h(6) * 0.2));
             break;
         }
@@ -533,7 +567,7 @@ function stoneCell(granite: MeshBuilder, strata: MeshBuilder, gx: number, gz: nu
             let yy = y;
             for (let k = 0; k < n; k++) {
                 const s = 1 - k * 0.24;
-                const th = 0.45 + h(5 + k) * 0.25;
+                const th = (0.45 + h(5 + k) * 0.25) * hScale;
                 strata.rock(x + ox * (1 + k), yy, z + oz * (1 - k), R * 0.95 * s, R * 0.8 * s, th + 0.2, rot + k * 0.4,
                     shade(scol, 0.95 + h(8 + k) * 0.12), rnd(k), 1.02);
                 yy += th;
@@ -541,14 +575,130 @@ function stoneCell(granite: MeshBuilder, strata: MeshBuilder, gx: number, gz: nu
             break;
         }
         default: {
-            // 石柱 + 脚下一块碎石
+            // 石柱 + 脚下一块碎石。约三分之一是高大的石柱：高 1.7~2.8 倍、粗 1.3~1.7 倍（粗细不受格子内缩放影响，
+            // 可以略微超出格子），石林里高矮差别大，不会一片同样高的石笋
             const s = 0.85 + h(4) * 0.3;
-            strata.rock(x + ox, y, z + oz, R * 0.75 * s, R * 0.65 * s, (2.2 + h(5) * 0.9) * s, rot, scol, rnd(0), 0.82);
+            const big = h(20) < 0.35;
+            const tall = big ? 1.7 + h(21) * 1.1 : 0.8 + h(21) * 0.5;
+            const fat = big ? (1.3 + h(22) * 0.4) / Math.max(scale, 0.6) : 1;
+            const pr = R * fat;
+            strata.rock(x + ox, y, z + oz, pr * 0.75 * s, pr * 0.65 * s, (2.2 + h(5) * 0.9) * s * tall * hScale, rot, scol, rnd(0),
+                big ? 0.86 : 0.82, undefined, big ? 9 : 7);
             const a = rot + 1.9;
-            strata.rock(x + Math.cos(a) * R * 0.7, y, z + Math.sin(a) * R * 0.7, R * 0.3, R * 0.25, 0.45,
+            strata.rock(x + Math.cos(a) * pr * 0.7, y, z + Math.sin(a) * pr * 0.7, pr * 0.3, pr * 0.25, 0.45 * hScale * (big ? 1.5 : 1),
                 a, shade(scol, 0.9), rnd(1), 1.1);
             break;
         }
+    }
+}
+
+/**
+ * 大石头：一颗石头跨好几格，只在成片的石林里出现。
+ * 由全局哈希决定，所以相邻块算出完全一样的结果（中心所在的块负责画，其余块只用来避开重叠）
+ */
+interface BigStone { x: number; z: number; r: number; h: number; rot: number; strata: boolean; moss: boolean; seed: number }
+const BIG_STONE_STEP = 10;
+const BIG_STONE_REACH = 9;   // 半径上限 + 余量，查覆盖范围时用
+
+class BigStoneCache {
+    private map = new Map<number, BigStone | null>();
+    constructor(private kindG: (gx: number, gz: number) => number) { }
+    private at(ix: number, iz: number): BigStone | null {
+        const key = ix * 73856093 + iz * 19349663;
+        let s = this.map.get(key);
+        if (s !== undefined) return s;
+        s = bigStoneAt(ix, iz, this.kindG);
+        this.map.set(key, s);
+        return s;
+    }
+    /** 覆盖点 (wx,wz) 的大石头中，距离最近的那颗的“靠近程度”（0 没碰到，1 完全盖住） */
+    cover(wx: number, wz: number): number {
+        let best = 0;
+        const i0 = Math.floor(wx / BIG_STONE_STEP), j0 = Math.floor(wz / BIG_STONE_STEP);
+        for (let j = j0 - 1; j <= j0 + 1; j++) for (let i = i0 - 1; i <= i0 + 1; i++) {
+            const s = this.at(i, j);
+            if (!s) continue;
+            const t = 1 - Math.hypot(wx - s.x, wz - s.z) / (s.r + 0.6);
+            if (t > best) best = t;
+        }
+        return best;
+    }
+    /** 可能与本块相交的全部大石头（先把本块及周围一圈网格点算出来，之后 all() 才完整） */
+    all(): BigStone[] {
+        const out: BigStone[] = [];
+        for (const s of this.map.values()) if (s) out.push(s);
+        return out;
+    }
+    /** 保证覆盖矩形 [x0,x1]×[z0,z1]（外扩半径余量）的网格点都已计算 */
+    ensure(x0: number, z0: number, x1: number, z1: number) {
+        const i0 = Math.floor((x0 - BIG_STONE_REACH) / BIG_STONE_STEP), i1 = Math.floor((x1 + BIG_STONE_REACH) / BIG_STONE_STEP);
+        const j0 = Math.floor((z0 - BIG_STONE_REACH) / BIG_STONE_STEP), j1 = Math.floor((z1 + BIG_STONE_REACH) / BIG_STONE_STEP);
+        for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) this.at(i, j);
+    }
+}
+
+function bigStoneCover(c: BigStoneCache, wx: number, wz: number): number { return c.cover(wx, wz); }
+
+/** 网格点 (ix,iz) 上的大石头（没有则返回 null） */
+function bigStoneAt(ix: number, iz: number, kindG: (gx: number, gz: number) => number): BigStone | null {
+    const h = (k: number) => hash2(ix, iz, SEED + 4700 + k);
+    if (h(0) > 0.7) return null;   // 不是每个网格点都有
+    const x = (ix + 0.5) * BIG_STONE_STEP + (h(1) - 0.5) * BIG_STONE_STEP * 0.7;
+    const z = (iz + 0.5) * BIG_STONE_STEP + (h(2) - 0.5) * BIG_STONE_STEP * 0.7;
+    // 只长在成片的石林里：中心和周围一圈都得是石头格子
+    let rock = 0, n = 0;
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+        n++;
+        if (kindG(Math.floor(x / CELL) + dx * 2, Math.floor(z / CELL) + dz * 2) === Cell.Rock) rock++;
+    }
+    if (rock < n - 1) return null;
+    const zone = stoneZone(x, z);
+    return {
+        x, z,
+        r: 2.2 + h(3) * 2.6,          // 直径 4~10 米
+        h: (1.4 + h(4) * 2.4) * stoneHeightScale(x, z),
+        rot: h(5) * Math.PI * 2,
+        strata: h(6) < zone,
+        moss: h(7) < 0.12,
+        seed: (hash2(ix, iz, SEED + 4800) * 1e9) | 0,
+    };
+}
+
+/** 这一带石头的整体高矮（0.6~1.6），几十米一个变化，石林里有高耸的石柱区也有低矮的碎石区 */
+function stoneHeightScale(wx: number, wz: number): number {
+    return 0.6 + fbm(wx / 46, wz / 46, 2, SEED + 4900);
+}
+
+/** 这一带的岩性（0 全是花岗岩，1 全是砂岩），大片渐变，灰色和黄色不会一格一格混在一起 */
+function stoneZone(wx: number, wz: number): number {
+    return fbm(wx / 34, wz / 34, 2, SEED + 5000);
+}
+
+function drawBigStone(granite: MeshBuilder, strata: MeshBuilder, s: BigStone) {
+    const mb = s.strata ? strata : granite;
+    const col = shade(s.strata ? STRATA : GRANITE, 0.92 + hash2(s.seed, 1, SEED + 4810) * 0.16);
+    const rnd = (i: number) => hash2(s.seed, i, SEED + 4820);
+    const rx = s.r * (0.85 + hash2(s.seed, 2, SEED + 4830) * 0.3);
+    const rz = s.r * (0.85 + hash2(s.seed, 3, SEED + 4830) * 0.3);
+    const bulge = s.strata ? 0.8 + hash2(s.seed, 4, SEED + 4830) * 0.25 : 1.02 + hash2(s.seed, 4, SEED + 4830) * 0.16;
+    // 14 个切面，大石头看起来圆，不会是一个大锥子
+    mb.rock(s.x, terrainHeight(s.x, s.z) - 0.4, s.z, rx, rz, s.h, s.rot, col, rnd, bulge,
+        s.moss ? shade(MOSS, 0.9 + hash2(s.seed, 5, SEED + 4830) * 0.2) : undefined, 14);
+}
+
+/** 格子角落的碎石：只在石头格子旁边出现，打破格子的轮廓 */
+function pebbles(granite: MeshBuilder, strata: MeshBuilder, gx: number, gz: number,
+    x0: number, z0: number, y: number, big: BigStoneCache, strataZone: number, extra = 0) {
+    const h = (k: number) => hash2(gx, gz, SEED + 4950 + k);
+    const n = extra + 1 + Math.floor(h(0) * 2);
+    for (let k = 0; k < n; k++) {
+        const px = x0 + h(10 + k) * CELL, pz = z0 + h(20 + k) * CELL;
+        if (big.cover(px, pz) > 0) continue;
+        const mb = h(30 + k) < strataZone ? strata : granite;
+        const r = 0.16 + h(40 + k) * 0.22;
+        const col = shade(mb === strata ? STRATA : GRANITE, 0.85 + h(50 + k) * 0.25);
+        mb.rock(px, y - 0.1, pz, r, r * (0.75 + h(60 + k) * 0.4), 0.22 + h(70 + k) * 0.28,
+            h(80 + k) * Math.PI * 2, col, i => hash2(gx * 17 + k, gz * 13 + i, SEED + 4960), 1.1);
     }
 }
 
