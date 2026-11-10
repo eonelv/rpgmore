@@ -99,9 +99,13 @@ function isPath(kind: number): boolean {
     return kind === Cell.Bridge || kind === Cell.Road;
 }
 
-/** 贴图层比下面的地面高一点，避免重合闪烁；草地盖在沙地上面（沙草交界处草的边缘压住沙子） */
-const SAND_LIFT = 0.01;
-const GRASS_LIFT = 0.02;
+/**
+ * 贴图层比下面的地面高一点，避免重合闪烁；草地盖在沙地上面（沙草交界处草的边缘压住沙子）。
+ * 间距必须大于深度缓冲的最小可分辨距离：相机 near=0.3、far=1000，16 位深度缓冲在约 25 米处
+ * 的精度只有约 0.07 米，0.01 的间距会让两层在深度测试里交替胜出，接触边缘随相机移动闪烁。
+ */
+const SAND_LIFT = 0.15;
+const GRASS_LIFT = 0.3;
 
 /** 草地边缘下面垫的地面颜色（被裁掉的地方露出来的颜色） */
 function underColor(kind: number): RGB {
@@ -175,7 +179,16 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
             }
             // 沙滩挨着水的顶点：水格子也算沙地，沙子一直铺到水下，裁切发生在水面以下，
             // 不会在岸上露出水底的颜色；岸线由水面与地形相交 + 泡沫决定
-            if (s > 0) s += w;
+            if (s > 0) {
+                s += w;
+            } else if (w > 0) {
+                // 四邻全是水格的顶点（s===0）：若地形接近水面，也铺沙地贴图以遮盖水底深褐色。
+                // depth>0 表示在水下；depth<0 表示地形高于水面（水格噪声低但高度可能超过 WATER_Y）。
+                // smoothstep(0.2, 1.6, depth)：0.2m 以内全沙，1.6m 以下无沙，过渡藏在水面以下不可见。
+                const depth = WATER_Y - h;
+                const sf = 1 - smoothstep(0.2, 1.6, depth);
+                if (sf > 0) s = 4 * sf;
+            }
             if (road) h = Math.max(h, WALK_MIN_Y) - 0.02;
             H[z * V + x] = h;
             MG[z * V + x] = mg;

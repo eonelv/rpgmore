@@ -63,11 +63,12 @@ function grassEdgeAlpha(): Float32Array {
     const n = new Float32Array(SIZE * SIZE);
     for (let y = 0; y < SIZE; y++) {
         for (let x = 0; x < SIZE; x++) {
-            // 只用低频成团的噪声：高频层和草叶会在边缘切出细碎的草点和细长的毛刺
-            n[y * SIZE + x] = pfbm(x / SIZE, y / SIZE, 8, 8, 3, SEED + 1500);
+            // 降低频率（3×3 → ~2.7m特征）、减少层数（2层），特征足够大不会在过渡带里切出孤立碎块
+            n[y * SIZE + x] = pfbm(x / SIZE, y / SIZE, 3, 3, 2, SEED + 1500);
         }
     }
-    return equalizeAlpha(blurWrap(n, 4));
+    // 加大模糊半径合并残余碎块；缩小 alpha 范围[0.55,0.85]收窄过渡带宽度
+    return equalizeAlpha(blurWrap(n, 6), 0.55, 0.85);
 }
 
 /** 无缝的盒式模糊（横竖各一遍，坐标取模），去掉阈值切割后残留的小碎块 */
@@ -90,13 +91,13 @@ function blurWrap(src: Float32Array, r: number): Float32Array {
     return out;
 }
 
-/** 直方图均衡：把任意分布的值按排名映射到 [0.5, 0.98] */
-function equalizeAlpha(n: Float32Array): Float32Array {
+/** 直方图均衡：把任意分布的值按排名映射到 [lo, hi] */
+function equalizeAlpha(n: Float32Array, lo = 0.5, hi = 0.98): Float32Array {
     const order = new Uint32Array(SIZE * SIZE);
     for (let i = 0; i < order.length; i++) order[i] = i;
     order.sort((a, b) => n[a] - n[b]);
     const out = new Float32Array(SIZE * SIZE);
-    for (let r = 0; r < order.length; r++) out[order[r]] = 0.5 + 0.48 * (r / (order.length - 1));
+    for (let r = 0; r < order.length; r++) out[order[r]] = lo + (hi - lo) * (r / (order.length - 1));
     return out;
 }
 
@@ -225,8 +226,9 @@ function sandEdgeAlpha(): Float32Array {
     const n = new Float32Array(SIZE * SIZE);
     for (let y = 0; y < SIZE; y++)
         for (let x = 0; x < SIZE; x++)
-            n[y * SIZE + x] = pfbm(x / SIZE, y / SIZE, 4, 4, 3, SEED + 1900);
-    return equalizeAlpha(blurWrap(n, 4));
+            // 同草地方案：降低频率（3×3）、减少层数（2层），过渡带更整洁
+            n[y * SIZE + x] = pfbm(x / SIZE, y / SIZE, 3, 3, 2, SEED + 1900);
+    return equalizeAlpha(blurWrap(n, 6), 0.55, 0.85);
 }
 
 /**
