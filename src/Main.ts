@@ -7,14 +7,15 @@ import { PathService, Vec2 } from "./world/PathFinder";
 import { SpawnRegistry } from "./world/Spawns";
 import { CELL, CHUNK_CELLS, CHUNK_SIZE, chopResult } from "./world/WorldConfig";
 import { loadWaterShader } from "./world/WaterShader";
-import { groundY, spawnPoint } from "./world/WorldGen";
+import { groundY, nearestMountainTop, spawnPoint } from "./world/WorldGen";
 
 const { regClass } = Laya;
 
 /**
  * 开放世界原型入口。
  * 操作：鼠标左键点击地面 → 主角自动寻路；点击树 → 走过去砍掉；按住 F 砍面前的树；WASD 直接移动；滚轮缩放；
- *      G 键自动前往 1~2 公里外的随机地点（测试长距离分段寻路和流式加载）；M 键切换小地图/大地图。
+ *      G 键自动前往 1~2 公里外的随机地点（测试长距离分段寻路和流式加载）；H 键沿山路去最近的山顶（在山顶再按去下一座）；
+ *      M 键切换小地图/大地图。
  * 刷怪点：在场景里任意位置放挂了 SpawnPoint 组件的节点，启动时自动收集。
  */
 @regClass()
@@ -103,6 +104,7 @@ export class Main extends Laya.Script {
         });
         Laya.stage.on(Laya.Event.KEY_DOWN, this, (e: Laya.Event) => {
             if (e.keyCode === Laya.Keyboard.G) this.travelFar();
+            if (e.keyCode === Laya.Keyboard.H) this.climbNearestPeak();
             if (e.keyCode === Laya.Keyboard.M) this.minimap.toggle();
         });
         this.ready = true;
@@ -248,6 +250,23 @@ export class Main extends Laya.Script {
         this.walkTo({ x: this.player.pos.x + Math.cos(a) * d, z: this.player.pos.z + Math.sin(a) * d });
     }
 
+    /** 已经到过的山顶；H 键会跳过它们，去还没去过的山 */
+    private visitedPeaks: Vec2[] = [];
+    /** 当前 H 键的目标山顶 */
+    private peakTarget: Vec2 | null = null;
+
+    /** H 键：沿山路寻路到最近的、还没到过的山顶 */
+    private climbNearestPeak() {
+        const p = this.player.pos;
+        // 到了（或站在）上一个目标山顶附近，记为到过
+        const t = this.peakTarget;
+        if (t && Math.hypot(t.x - p.x, t.z - p.z) < 20) this.visitedPeaks.push(t);
+        const top = nearestMountainTop(p.x, p.z, this.visitedPeaks);
+        if (!top) { console.log("附近没有修了山路的山"); return; }
+        this.peakTarget = top;
+        this.walkTo(top);
+    }
+
     private walkTo(target: Vec2) {
         this.chopTarget = null;
         this.player.cancelPath();
@@ -338,6 +357,6 @@ export class Main extends Laya.Script {
             `已加载块 ${this.chunks.loadedCount}  排队 ${this.chunks.queuedCount}  寻路数据缓存 ${this.nav.cachedCount}  已砍 ${this.chopCount}  地图修改 ${this.nav.editCount}\n` +
             `刷怪点 ${this.spawns.all.length}  怪物 ${this.monsters.monsters.length}  追击 ${this.monsters.chasingCount}  寻路排队 ${this.paths.pending}  寻路耗时 ${this.paths.lastFrameMs.toFixed(1)}ms\n` +
             `左键点地面: 自动寻路   左键点树: 走过去砍掉   F(按住): 砍面前的树
-WASD: 移动   滚轮: 缩放   G: 前往远方   M: 大地图`;
+WASD: 移动   滚轮: 缩放   G: 前往远方   H: 去最近的山顶   M: 大地图`;
     }
 }

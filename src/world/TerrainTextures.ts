@@ -60,11 +60,16 @@ function toRGBA(buf: Float32Array, alpha?: Float32Array): Uint8Array {
  * 先做直方图均衡，让 alpha 均匀分布在 [0.5, 0.98]，过渡带宽度才和权重成正比。
  */
 function grassEdgeAlpha(): Float32Array {
+    return edgeAlpha(SEED + 1500);
+}
+
+/** 参差边缘的裁切值：均衡到 [0.55, 0.85]，与 ChunkRenderer 里顶点 alpha 的映射配套 */
+function edgeAlpha(seed: number): Float32Array {
     const n = new Float32Array(SIZE * SIZE);
     for (let y = 0; y < SIZE; y++) {
         for (let x = 0; x < SIZE; x++) {
             // 降低频率（3×3 → ~2.7m特征）、减少层数（2层），特征足够大不会在过渡带里切出孤立碎块
-            n[y * SIZE + x] = pfbm(x / SIZE, y / SIZE, 3, 3, 2, SEED + 1500);
+            n[y * SIZE + x] = pfbm(x / SIZE, y / SIZE, 3, 3, 2, seed);
         }
     }
     // 加大模糊半径合并残余碎块；缩小 alpha 范围[0.55,0.85]收窄过渡带宽度
@@ -430,6 +435,13 @@ export const GRAVEL_TILE = 4;
 export function gravelTexture(): Laya.Texture2D {
     if (!gravelTex || gravelTex.destroyed) gravelTex = makeTexture(toRGBA(gravelPixels()));
     return gravelTex;
+}
+
+let trailTex: Laya.Texture2D | null = null;
+/** 山路：砂石贴图 + alpha 里的参差边缘（alpha 测试裁出路边），和平地道路是同一种砂石 */
+export function trailTexture(): Laya.Texture2D {
+    if (!trailTex || trailTex.destroyed) trailTex = makeTexture(toRGBA(gravelPixels(), edgeAlpha(SEED + 2700)));
+    return trailTex;
 }
 
 let grassTex: Laya.Texture2D | null = null;

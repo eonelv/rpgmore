@@ -61,10 +61,21 @@ export function mountainHeight(wx: number, wz: number, n: number): number {
     return mask * (0.1 + ridge * ridge * 1.1) * MOUNTAIN_HEIGHT * roadValley(wx, wz);
 }
 
-/** 地形高度（米），是世界坐标的连续函数，所以块与块之间不会有接缝 */
-export function terrainHeight(wx: number, wz: number): number {
+/** 不含山路修整的地形高度（米） */
+function rawHeight(wx: number, wz: number): number {
     const n = terrainNoise(wx, wz);
     return (n - 0.5) * 14 + mountainHeight(wx, wz, n);
+}
+
+/**
+ * 地形高度（米），是世界坐标的连续函数，所以块与块之间不会有接缝。
+ * 山路附近的地面压到山路的高度（距中心线 MTN_FLAT 米内完全压平，MTN_FALL 米外恢复原高）
+ */
+export function terrainHeight(wx: number, wz: number): number {
+    const h = rawHeight(wx, wz);
+    const segs = mountainSegsNearChunk(Math.floor(wx / CHUNK_SIZE), Math.floor(wz / CHUNK_SIZE));
+    if (segs.length === 0 || !nearestMountainTrail(segs, wx, wz)) return h;
+    return h + (nearY - h) * nearF;
 }
 
 /** 角色站立高度 */
@@ -308,6 +319,360 @@ function roadValley(wx: number, wz: number): number {
     return f;
 }
 
+// ==================== 山路 ====================
+//
+// 高的山上修一条盘山小路，从山顶一直通到山脚（山体高度低于 MOUNTAIN_CELL_MIN 的地方，常常就是主干道的山谷）。
+// 1. 每个大区找最多 PEAKS_PER_REGION 座山体高度超过 PEAK_MIN 的山峰。
+// 2. 以山峰为中心在 MTN_GRID 米的粗网格上做 Dijkstra（16 个方向），超过坡度上限的边代价极高，
+//    所以路会沿等高线斜着绕上去，自然形成之字形。
+// 3. 折线做 Chaikin 平滑、按 MTN_SAMPLE 米重采样，取原始地形高度后平滑，
+//    再从山脚往上逐点把坡度夹到 MTN_GRADE 以内（太陡的地方挖低）。
+// 4. terrainHeight 把山路附近的地面压到路面高度（两侧形成挖方的岩壁），路面格子是 Road。
+
+/** 山体高度超过这个值（米）的山峰修山路 */
+const PEAK_MIN = 14;
+const PEAKS_PER_REGION = 2;
+/** 同一大区两座修路山峰的最小间距（米） */
+const PEAK_SPACING = 200;
+/** 找山峰的采样间距（米） */
+const PEAK_STEP = 16;
+/** 山路坡度上限（高度差 / 水平距离），0.3 约 17° */
+export const MTN_GRADE = 0.3;
+/** 规划山路的粗网格间距（米）和半径（格），半径决定山路最远伸出 176 米 */
+const MTN_GRID = 8;
+const MTN_GRID_R = 22;
+/** 山路折线的采样间距（米） */
+const MTN_SAMPLE = 3;
+/** 山路路面半宽（米） */
+const MTN_HALF = 1.8;
+/** 距中心线 MTN_FLAT 米内地面压到路面高度，MTN_FALL 米外恢复原高 */
+const MTN_FLAT = 3.5;
+const MTN_FALL = 10;
+/** 路面与原始地形的高度差上限（米），再往上修挖方/填方太大就在这里结束 */
+const MTN_MAX_CUT = 5;
+/** 之字形相邻两段中心线的最小间距（米），保证两段路面之间留出过渡的坡 */
+const MTN_GAP = 2 * MTN_HALF + 3;
+
+/** 16 个方向：上下左右、对角、马步，方便走出接近等高线的斜线 */
+const MTN_DIRS = [
+    [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1],
+    [2, 1], [1, 2], [-1, 2], [-2, 1], [-2, -1], [-1, -2], [1, -2], [2, -1],
+];
+
+/**
+ * 山路的终点只能落在已有道路（主干道、小路）上，这样山路一定和道路网连通。
+ * 只到“山体结束”不够：山脚常常是大片散石（terrainNoise > 0.66）、密林，或者被群山围住的小盆地，
+ * 路在那里结束就走不出去
+ */
+function isTrailGoal(x: number, z: number, n: number, m: number): boolean {
+    if (m >= MOUNTAIN_CELL_MIN) return false;
+    for (const r of roadsNearChunk(Math.floor(x / CHUNK_SIZE), Math.floor(z / CHUNK_SIZE))) {
+        if (lineDistance(r, x, z, r.style.half) <= r.style.half - 1) return true;
+    }
+    return false;
+}
+
+/** 从山峰 peak 规划一条下到山脚的路，返回 x,z,y 三元组（山脚 -> 山顶）；找不到返回 null */
+function planMountainTrail(peak: P): number[] | null {
+    const R = MTN_GRID_R, W = 2 * R + 1, n = W * W;
+    const hs = new Float32Array(n);
+    /** 0 未采样，1 可以修路经过，2 终点，3 水（不能走） */
+    const type = new Uint8Array(n);
+    const sample = (i: number) => {
+        if (type[i] !== 0) return type[i];
+        const x = peak.x + (i % W - R) * MTN_GRID, z = peak.z + (((i / W) | 0) - R) * MTN_GRID;
+        const tn = terrainNoise(x, z);
+        const m = mountainHeight(x, z, tn);
+        hs[i] = (tn - 0.5) * 14 + m;
+        return type[i] = tn < WATER_NOISE ? 3 : isTrailGoal(x, z, tn, m) ? 2 : 1;
+    };
+    const dist = new Float32Array(n).fill(Infinity);
+    const parent = new Int32Array(n).fill(-1);
+    const done = new Uint8Array(n);
+    const heap = new MinHeap();
+    const start = R * W + R;
+    sample(start);
+    dist[start] = 0;
+    heap.push(start, 0);
+    let goal = -1;
+    while (heap.size > 0) {
+        const cur = heap.pop();
+        if (done[cur]) continue;
+        done[cur] = 1;
+        if (type[cur] === 2) { goal = cur; break; }
+        const cx = cur % W, cz = (cur / W) | 0;
+        for (const [dx, dz] of MTN_DIRS) {
+            const nx = cx + dx, nz = cz + dz;
+            if (nx < 0 || nz < 0 || nx >= W || nz >= W) continue;
+            const ni = nz * W + nx;
+            if (done[ni] || sample(ni) === 3) continue;
+            const L = Math.sqrt(dx * dx + dz * dz) * MTN_GRID;
+            const g = Math.abs(hs[ni] - hs[cur]) / L;
+            const cost = L * (1 + 0.5 * g + 80 * Math.max(0, g - MTN_GRADE));
+            if (dist[cur] + cost < dist[ni]) {
+                dist[ni] = dist[cur] + cost;
+                parent[ni] = cur;
+                heap.push(ni, dist[ni]);
+            }
+        }
+    }
+    if (goal < 0) return null;
+
+    // 网格路径（parent 链从山脚指回山顶，正好是山脚 -> 山顶的顺序）
+    let line: number[] = [];
+    for (let i = goal; i >= 0; i = parent[i]) {
+        line.push(peak.x + (i % W - R) * MTN_GRID, peak.z + (((i / W) | 0) - R) * MTN_GRID);
+    }
+    // Chaikin 平滑两次（保留两端）
+    for (let it = 0; it < 2; it++) {
+        const out = [line[0], line[1]];
+        for (let i = 0; i + 3 < line.length; i += 2) {
+            const ax = line[i], az = line[i + 1], bx = line[i + 2], bz = line[i + 3];
+            out.push(ax * 0.75 + bx * 0.25, az * 0.75 + bz * 0.25, ax * 0.25 + bx * 0.75, az * 0.25 + bz * 0.75);
+        }
+        out.push(line[line.length - 2], line[line.length - 1]);
+        line = out;
+    }
+    // 按 MTN_SAMPLE 米重采样
+    const xs: number[] = [], zs: number[] = [];
+    let carry = 0;
+    xs.push(line[0]); zs.push(line[1]);
+    for (let i = 0; i + 3 < line.length; i += 2) {
+        const ax = line[i], az = line[i + 1], dx = line[i + 2] - ax, dz = line[i + 3] - az;
+        const L = Math.sqrt(dx * dx + dz * dz);
+        let s = MTN_SAMPLE - carry;
+        for (; s <= L; s += MTN_SAMPLE) { xs.push(ax + dx * s / L); zs.push(az + dz * s / L); }
+        carry = L - (s - MTN_SAMPLE);
+    }
+    xs.push(line[line.length - 2]); zs.push(line[line.length - 1]);
+    // 路面高度：原始地形 -> 平滑 -> 从山脚往上夹坡度
+    const m = xs.length;
+    let ys = xs.map((x, i) => rawHeight(x, zs[i]));
+    for (let it = 0; it < 4; it++) {
+        const s = ys.slice();
+        for (let i = 1; i < m - 1; i++) s[i] = ys[i - 1] * 0.25 + ys[i] * 0.5 + ys[i + 1] * 0.25;
+        ys = s;
+    }
+    ys[0] = Math.max(ys[0], WALK_MIN_Y);
+    for (let i = 1; i < m; i++) {
+        const d = Math.hypot(xs[i] - xs[i - 1], zs[i] - zs[i - 1]) * MTN_GRADE;
+        ys[i] = Math.min(Math.max(ys[i], ys[i - 1] - d), ys[i - 1] + d);
+    }
+    // 路面与原始地形差太多（山顶附近找不到足够长的缓坡）的地方不再往上修，避免挖出很深的沟
+    // 平滑后之字形的两段可能挨得太近甚至交叉（高度不同），那里地面没法同时贴合两段路面，也在这里结束
+    const out: number[] = [];
+    for (let i = 0; i < m; i++) {
+        if (i > 0 && Math.abs(rawHeight(xs[i], zs[i]) - ys[i]) > MTN_MAX_CUT) break;
+        let clash = false;
+        for (let j = 0; j < i && !clash; j++) {
+            const d = Math.hypot(xs[i] - xs[j], zs[i] - zs[j]);
+            // 沿路距离远大于直线距离：是另一段路
+            clash = d < MTN_GAP && (i - j) * MTN_SAMPLE > 2 * d + 6 && Math.abs(ys[i] - ys[j]) > 0.5;
+        }
+        if (clash) break;
+        out.push(xs[i], zs[i], ys[i]);
+    }
+    return out;
+}
+
+/** 山峰位置：从采样点出发，按 4 米步长爬到局部最高处 */
+function climbToPeak(x: number, z: number): P {
+    let h = rawHeight(x, z);
+    for (let it = 0; it < 16; it++) {
+        let bx = x, bz = z;
+        for (const [dx, dz] of MTN_DIRS) {
+            if (Math.abs(dx) > 1 || Math.abs(dz) > 1) break;   // 只用前 8 个方向
+            const hh = rawHeight(x + dx * 4, z + dz * 4);
+            if (hh > h) { h = hh; bx = x + dx * 4; bz = z + dz * 4; }
+        }
+        if (bx === x && bz === z) break;
+        x = bx; z = bz;
+    }
+    return { x, z };
+}
+
+const mtnTrailCache = new Map<number, number[][]>();
+/** 大区 (rx,rz) 内的山路（每条是 x,z,y 三元组，山脚 -> 山顶） */
+function regionMountainTrails(rx: number, rz: number): number[][] {
+    return cached(mtnTrailCache, regionKey(rx, rz), 1024, () => {
+        const cands: { x: number; z: number; m: number }[] = [];
+        const x0 = (rx - 0.5) * REGION + PEAK_STEP / 2, z0 = (rz - 0.5) * REGION + PEAK_STEP / 2;
+        for (let z = z0; z < (rz + 0.5) * REGION; z += PEAK_STEP) {
+            for (let x = x0; x < (rx + 0.5) * REGION; x += PEAK_STEP) {
+                const m = mountainHeight(x, z, terrainNoise(x, z));
+                if (m >= PEAK_MIN) cands.push({ x, z, m });
+            }
+        }
+        cands.sort((a, b) => b.m - a.m);
+        const peaks: P[] = [];
+        for (const c of cands) {
+            if (peaks.length >= PEAKS_PER_REGION) break;
+            if (peaks.some(p => Math.hypot(p.x - c.x, p.z - c.z) < PEAK_SPACING)) continue;
+            peaks.push(climbToPeak(c.x, c.z));
+        }
+        const out: number[][] = [];
+        for (const p of peaks) {
+            const t = planMountainTrail(p);
+            if (t && t.length >= 6) out.push(t);
+        }
+        return out;
+    });
+}
+
+const mtnSegCache = new Map<number, Float64Array>();
+/**
+ * 可能影响块 (cx,cz) 的山路线段，每段 6 个数 ax,az,ay,bx,bz,by。
+ * 山路离候选采样点最远约 MTN_GRID_R × MTN_GRID × √2 + 爬峰偏移 64 ≈ 315 米，小于一个大区（512 米），
+ * 所以隔两个大区的山路碰不到本块，看周围 3x3 个大区就够了
+ */
+function mountainSegsNearChunk(cx: number, cz: number): Float64Array {
+    return cached(mtnSegCache, regionKey(cx, cz), 4096, () => {
+        const x0 = cx * CHUNK_SIZE - MTN_FALL, x1 = (cx + 1) * CHUNK_SIZE + MTN_FALL;
+        const z0 = cz * CHUNK_SIZE - MTN_FALL, z1 = (cz + 1) * CHUNK_SIZE + MTN_FALL;
+        const rx = Math.round((cx + 0.5) * CHUNK_SIZE / REGION), rz = Math.round((cz + 0.5) * CHUNK_SIZE / REGION);
+        const out: number[] = [];
+        for (let j = -1; j <= 1; j++) {
+            for (let i = -1; i <= 1; i++) {
+                for (const t of regionMountainTrails(rx + i, rz + j)) {
+                    for (let k = 0; k + 5 < t.length; k += 3) {
+                        const ax = t[k], az = t[k + 1], bx = t[k + 3], bz = t[k + 4];
+                        if (Math.max(ax, bx) < x0 || Math.min(ax, bx) > x1 || Math.max(az, bz) < z0 || Math.min(az, bz) > z1) continue;
+                        out.push(ax, az, t[k + 2], bx, bz, t[k + 5]);
+                    }
+                }
+            }
+        }
+        return new Float64Array(out);
+    });
+}
+
+/**
+ * nearestMountainTrail 的结果：
+ * nearD：到最近山路中心线的距离（米）；
+ * nearF：地面压向路面的程度（0~1，取各线段的最大值）；
+ * nearY：路面高度，按 1/(d⁴+0.05) 加权平均附近各线段的高度。
+ * 之字形相邻的两段路离得很近时，中间的地面在两段的高度之间平滑过渡，不会因为“最近的线段”切换而出现台阶；
+ * 站在某段路的中心线上时权重几乎全在这段上，路面就是它自己的高度
+ */
+let nearD = Infinity, nearY = 0, nearF = 0;
+function nearestMountainTrail(s: Float64Array, x: number, z: number): boolean {
+    let best = Infinity, wSum = 0, ySum = 0, f = 0;
+    for (let i = 0; i < s.length; i += 6) {
+        const ax = s[i], az = s[i + 1], dx = s[i + 3] - ax, dz = s[i + 4] - az;
+        if (Math.min(ax, ax + dx) - x > MTN_FALL || x - Math.max(ax, ax + dx) > MTN_FALL ||
+            Math.min(az, az + dz) - z > MTN_FALL || z - Math.max(az, az + dz) > MTN_FALL) continue;
+        const len2 = dx * dx + dz * dz;
+        let t = len2 > 0 ? ((x - ax) * dx + (z - az) * dz) / len2 : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const ex = ax + dx * t - x, ez = az + dz * t - z;
+        const d2 = ex * ex + ez * ez;
+        if (d2 < best) best = d2;
+        if (d2 >= MTN_FALL * MTN_FALL) continue;
+        const fi = 1 - smoothstep(MTN_FLAT, MTN_FALL, Math.sqrt(d2));
+        const w = fi / (d2 * d2 + 0.05);
+        wSum += w;
+        ySum += w * (s[i + 2] + (s[i + 5] - s[i + 2]) * t);
+        if (fi > f) f = fi;
+    }
+    nearD = Math.sqrt(best);
+    nearF = f;
+    nearY = wSum > 0 ? ySum / wSum : 0;
+    return f > 0;
+}
+
+class MinHeap {
+    private idx: number[] = [];
+    private key: number[] = [];
+    get size() { return this.idx.length; }
+    push(i: number, k: number) {
+        const a = this.idx, b = this.key;
+        let n = a.length;
+        a.push(i); b.push(k);
+        while (n > 0) {
+            const p = (n - 1) >> 1;
+            if (b[p] <= k) break;
+            a[n] = a[p]; b[n] = b[p];
+            n = p;
+        }
+        a[n] = i; b[n] = k;
+    }
+    pop(): number {
+        const a = this.idx, b = this.key;
+        const top = a[0];
+        const li = a.pop()!, lk = b.pop()!;
+        const len = a.length;
+        if (len > 0) {
+            let n = 0;
+            for (; ;) {
+                let c = 2 * n + 1;
+                if (c >= len) break;
+                if (c + 1 < len && b[c + 1] < b[c]) c++;
+                if (b[c] >= lk) break;
+                a[n] = a[c]; b[n] = b[c];
+                n = c;
+            }
+            a[n] = li; b[n] = lk;
+        }
+        return top;
+    }
+}
+
+/**
+ * 离 (wx,wz) 最近的山路终点（山路的最高处，世界坐标），在周围 5x5 个大区里找；没有山路返回 null。
+ * exclude：跳过离这些点 20 米以内的终点（去过的山顶）；
+ * minTopY：只要路面最高处不低于这个高度（米）的山路，半路截断的矮山路不算山顶
+ */
+export function nearestMountainTop(wx: number, wz: number, exclude: P[] = [], minTopY = 15): P | null {
+    const rx = Math.round(wx / REGION), rz = Math.round(wz / REGION);
+    let best: P | null = null, bestD = Infinity;
+    for (let j = -2; j <= 2; j++) {
+        for (let i = -2; i <= 2; i++) {
+            for (const t of regionMountainTrails(rx + i, rz + j)) {
+                const x = t[t.length - 3], z = t[t.length - 2];
+                if (t[t.length - 1] < minTopY) continue;
+                if (exclude.some(e => Math.hypot(x - e.x, z - e.z) < 20)) continue;
+                const d = Math.hypot(x - wx, z - wz);
+                if (d < bestD) { bestD = d; best = { x, z }; }
+            }
+        }
+    }
+    return best;
+}
+
+/** 山路路面半宽（米），渲染时用来画路面边缘 */
+export const MOUNTAIN_TRAIL_HALF = MTN_HALF;
+
+/** 块 (cx,cz) 附近（MTN_FALL 米内）有没有山路 */
+export function chunkHasMountainTrail(cx: number, cz: number): boolean {
+    return mountainSegsNearChunk(cx, cz).length > 0;
+}
+
+/** 到最近山路中心线的距离（米）；MTN_FALL 米内没有山路时返回 Infinity */
+export function mountainTrailDistance(wx: number, wz: number): number {
+    const segs = mountainSegsNearChunk(Math.floor(wx / CHUNK_SIZE), Math.floor(wz / CHUNK_SIZE));
+    if (segs.length === 0) return Infinity;
+    nearestMountainTrail(segs, wx, wz);
+    return nearD;
+}
+
+/**
+ * 山路格子下面原本的地面类型（渲染用：山路画成连续的砂石带，格子本身按原来的地面画）。
+ * 只返回 Mountain / Sand / Grass，不返回会画出模型的类型（石头、树）
+ */
+export function trailGroundKind(wx: number, wz: number): number {
+    const n = terrainNoise(wx, wz);
+    if (mountainHeight(wx, wz, n) > MOUNTAIN_CELL_MIN) return Cell.Mountain;
+    return n < 0.395 ? Cell.Sand : Cell.Grass;
+}
+
+/** 是否在主干道/小路的路面上（不含山路） */
+export function onRegularRoad(wx: number, wz: number): boolean {
+    for (const r of roadsNearChunk(Math.floor(wx / CHUNK_SIZE), Math.floor(wz / CHUNK_SIZE))) {
+        if (lineDistance(r, wx, wz, r.style.half) <= r.style.half) return true;
+    }
+    return false;
+}
+
 /** 出生点（全局格子坐标）：大区 (0,0) 的枢纽，主干道交汇处 */
 export function spawnPoint(): { gx: number; gz: number } {
     const h = regionHub(0, 0);
@@ -338,6 +703,7 @@ export function generateChunk(cx: number, cz: number): ChunkData {
     const N = CHUNK_CELLS;
     const gx0 = cx * N, gz0 = cz * N;
     const roads = roadsNearChunk(cx, cz);
+    const mtnSegs = mountainSegsNearChunk(cx, cz);
 
     // 1. 地形 + 道路
     for (let lz = 0; lz < N; lz++) {
@@ -363,6 +729,11 @@ export function generateChunk(cx: number, cz: number): ChunkData {
                     kind = kind === Cell.Water ? Cell.Bridge : Cell.Road;
                     break;
                 }
+            }
+            // 山路：穿过山体、树、石头直接开路（规划时已避开水面）
+            if (kind !== Cell.Road && kind !== Cell.Bridge && kind !== Cell.Water &&
+                mtnSegs.length > 0 && nearestMountainTrail(mtnSegs, wx, wz) && nearD <= MTN_HALF) {
+                kind = Cell.Road;
             }
             k[lz * N + lx] = kind;
         }
