@@ -14,7 +14,16 @@ export function loadWaterShader(): Promise<any> {
     return Laya.loader.load(WATER_SHADER_URL);
 }
 
+/** 性能测试：true 时水面改用纯色半透明材质，用来区分“透明叠层”和“水面 shader 计算量”哪个是瓶颈 */
+const SIMPLE_WATER = false;
+
 export function createWaterMaterial(): Laya.Material {
+    if (SIMPLE_WATER) {
+        const m = new Laya.UnlitMaterial();
+        m.albedoColor = new Laya.Color(0.12, 0.42, 0.62, 0.7);
+        m.materialRenderMode = Laya.MaterialRenderMode.RENDERMODE_TRANSPARENT;
+        return m;
+    }
     const mat = new Laya.Material();
     mat.setShaderName(WATER_SHADER_NAME);
     mat.materialRenderMode = Laya.MaterialRenderMode.RENDERMODE_TRANSPARENT;

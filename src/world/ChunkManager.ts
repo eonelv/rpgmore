@@ -2,6 +2,12 @@ import { TerrainLayer, buildChunkMeshes, buildWaterMesh, createWorldMaterials } 
 import { NavGrid } from "./NavGrid";
 import { CHUNK_SIZE, LOAD_RADIUS, UNLOAD_RADIUS, chunkKey } from "./WorldConfig";
 
+/** 是否显示水面（排查手机帧率时临时关闭，改回 true 恢复） */
+const DRAW_WATER = true;
+/** 是否显示 alpha 测试的地面层（草地/沙地/山路），排查手机帧率用 */
+const DRAW_CUTOUT = true;
+const CUTOUT_LAYERS = new Set<TerrainLayer>(["grass", "sand", "trail"]);
+
 interface LoadedChunk {
     cx: number;
     cz: number;
@@ -112,7 +118,12 @@ export class ChunkManager {
     }
 
     private buildTerrain(c: LoadedChunk) {
-        const parts = buildChunkMeshes(this.nav.getChunk(c.cx, c.cz), (gx, gz) => this.nav.kind(gx, gz));
+        const parts = buildChunkMeshes(this.nav.getChunk(c.cx, c.cz), (gx, gz) => this.nav.kind(gx, gz))
+            .filter(p => {
+                if (DRAW_CUTOUT || !CUTOUT_LAYERS.has(p.layer)) return true;
+                p.mesh.destroy();
+                return false;
+            });
         c.meshes = parts.map(p => p.mesh);
         c.terrain = parts.map(p => {
             const ms = new Laya.MeshSprite3D(p.mesh);
@@ -126,7 +137,7 @@ export class ChunkManager {
         const root = new Laya.Sprite3D(`chunk_${cx}_${cz}`);
         const c: LoadedChunk = { cx, cz, root, meshes: [], terrain: [], water: buildWaterMesh(cx, cz) };
         this.buildTerrain(c);
-        if (c.water) {
+        if (c.water && DRAW_WATER) {
             const water = new Laya.MeshSprite3D(c.water);
             water.meshRenderer.sharedMaterial = this.waterMat;
             water.meshRenderer.castShadow = false;

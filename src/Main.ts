@@ -11,6 +11,9 @@ import { groundY, nearestMountainTop, spawnPoint } from "./world/WorldGen";
 
 const { regClass } = Laya;
 
+/** 是否绘制寻路线（排查手机帧率时临时关闭） */
+const DRAW_PATHS = false;
+
 /**
  * 开放世界原型入口。
  * 操作：鼠标左键点击地面 → 主角自动寻路；点击树 → 走过去砍掉；按住 F 砍面前的树；WASD 直接移动；滚轮缩放；
@@ -43,6 +46,9 @@ export class Main extends Laya.Script {
     private fpsAcc = 0; private fpsFrames = 0; private fps = 0;
 
     async onStart() {
+        // 性能统计面板（排查手机帧率用），放在左上角 HUD 文字下面
+        Laya.Stat.show(10, 130);
+
         // Laya 3 的 Scene3D 不在 2D 场景的子节点里，要通过 scene.scene3D 获取
         const owner = this.owner as Laya.Scene;
         this.scene3D = owner.scene3D;
@@ -156,7 +162,8 @@ export class Main extends Laya.Script {
         this.monsters.update(dt, p.pos);
         this.chunks.update(p.pos.x, p.pos.z);
         this.updateCamera(dt);
-        this.drawPaths();
+        // 性能测试：屏蔽寻路线绘制（DRAW_PATHS 改回 true 恢复）
+        if (DRAW_PATHS) this.drawPaths();
         this.minimap.update(p.pos, p.heading, this.monsters.monsters, this.marker.active ? p.finalTarget : null);
         this.updateHud(dt);
     }
