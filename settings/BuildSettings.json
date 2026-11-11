@@ -1,7 +1,10 @@
 {
   "name": "rpgmore",
+  "displayName": "大世界测试",
+  "minifyJS": true,
   "startupScene": "res://e13ac28a-6bc3-4a66-b660-a19c07c4ef7e",
   "android": {
+    "bundleIdentifier": "com.eone.rpgmore",
     "targetArchitectures": {
       "ARMv7": false,
       "ARM64": true,
