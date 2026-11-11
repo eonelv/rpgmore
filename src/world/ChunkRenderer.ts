@@ -2,8 +2,8 @@ import { hash2, fbm } from "./Noise";
 import { createWaterMaterial } from "./WaterShader";
 import { MeshBuilder, RGB } from "./MeshBuilder";
 import {
-    GRASS_TILE, GRAVEL_TILE, ROCK_TILE, SAND_TILE, STONE_TILE, TEX_GAIN,
-    graniteTexture, grassTexture, gravelTexture, plankTexture, rockTexture, sandTexture, strataTexture, trailTexture,
+    BARK_TILE, FOLIAGE_TILE, GRASS_TILE, GRAVEL_TILE, ROCK_TILE, SAND_TILE, STONE_TILE, TEX_GAIN,
+    barkTexture, foliageTexture, leafCardTexture, pineTexture, graniteTexture, grassTexture, gravelTexture, plankTexture, rockTexture, sandTexture, strataTexture, trailTexture,
 } from "./TerrainTextures";
 import { CELL, CHUNK_CELLS, CHUNK_SIZE, Cell, SEED } from "./WorldConfig";
 import {
@@ -56,6 +56,9 @@ function mountainRockColor(h: number, slope: number, jitter: number): RGB {
 }
 const TRUNK: RGB = [0.40, 0.27, 0.16];
 const LEAF: RGB = [0.16, 0.42, 0.20];
+const LEAF_LIGHT: RGB = [0.42, 0.62, 0.24];
+const LEAF_YELLOW: RGB = [0.74, 0.66, 0.20];
+const LEAF_RED: RGB = [0.62, 0.16, 0.12];
 const BUSH: RGB = [0.22, 0.50, 0.22];
 const BUSH_DARK: RGB = [0.14, 0.36, 0.17];
 const BUSH_LIGHT: RGB = [0.40, 0.62, 0.26];
@@ -84,8 +87,43 @@ function shade(c: RGB, f: number): RGB {
  * - plank：桥面，木板贴图 × 顶点色
  * - granite / strata：散落的石头（Cell.Rock），花岗岩 / 层状砂岩贴图，法线投影 UV；
  *   石头格子的地面是草地，不再单独铺一层石头底图
+ * - foliage / bark：树冠和灌木的叶子（树叶贴图）、树干树枝（树皮贴图），法线投影 UV
  */
-export type TerrainLayer = "base" | "grass" | "sand" | "plank" | "rock" | "gravel" | "trail" | "granite" | "strata";
+export type TerrainLayer = "base" | "grass" | "sand" | "plank" | "rock" | "gravel" | "trail" | "granite" | "strata"
+    | "foliage" | "bark" | "leafcard" | "pine";
+
+/** 树和灌木用的网格：叶团内核（树叶贴图）、叶簇面片（双面裁切）、松枝（双面裁切）、树干（树皮贴图）、花和果子（纯顶点色） */
+interface Veg { leaf: MeshBuilder; card: MeshBuilder; pine: MeshBuilder; bark: MeshBuilder; base: MeshBuilder }
+
+/**
+ * 一团树冠 / 灌木叶簇：里面一个偏暗的小叶团做内核（挡住视线，不会看穿），
+ * 外面围一圈斜着往外、往下探出的叶簇面片（贴图里叶片以外是透明的）。
+ * 轮廓是一簇簇参差的叶尖，不是一个多面体球。三角形数 = 20 + cards × 2
+ */
+function crown(v: Veg, x: number, yc: number, z: number, rx: number, ry: number, rz: number,
+    col: RGB, top: RGB, rand: (i: number) => number, cards: number) {
+    v.leaf.blob(x, yc, z, rx * 0.7, ry * 0.7, rz * 0.7, shade(col, 0.62), shade(col, 0.8), rand, 5);
+    const rot = rand(100) * Math.PI * 2;
+    for (let i = 0; i < cards; i++) {
+        // 在球面上均匀撒点（上面多、底下不放）
+        const yy = 0.95 - ((i + 0.5) / cards) * 1.35;
+        const rad = Math.sqrt(1 - yy * yy);
+        const a = rot + i * 2.4 + (rand(110 + i) - 0.5) * 0.5;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const d = [ca * rad, yy, sa * rad];                 // 往外的方向
+        const u = [-sa, 0, ca];                             // 水平切线
+        // 另一条边：往外 + 沿球面往下，面片相对球面斜着约 50°，正面和轮廓上都看得见
+        let vx = d[0] * 0.8 + yy * ca, vy = d[1] * 0.8 - rad, vz = d[2] * 0.8 + yy * sa;
+        const vl = Math.hypot(vx, vy, vz) || 1;
+        vx /= vl; vy /= vl; vz /= vl;
+        const p = [x + d[0] * rx * 0.78, yc + d[1] * ry * 0.78, z + d[2] * rz * 0.78];
+        const half = Math.min(rx, rz) * (0.5 + rand(130 + i) * 0.16);
+        // 法线：往外偏上，受光像一整个球
+        const nl = Math.hypot(d[0], d[1] + 0.5, d[2]) || 1;
+        const c = shade(mix(col, top, (yy + 0.4) / 1.35), 0.9 + rand(150 + i) * 0.2);
+        v.card.card(p, u, [vx, vy, vz], half, [d[0] / nl, (d[1] + 0.5) / nl, d[2] / nl], c, Math.floor(rand(170 + i) * 4));
+    }
+}
 export interface ChunkMesh { mesh: Laya.Mesh; layer: TerrainLayer }
 
 /** 地面用草地贴图的格子：草地以及长在草地上的树、灌木、树桩 */
@@ -147,9 +185,14 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
     const trail = new MeshBuilder(true);
     const granite = new MeshBuilder(true, STONE_TILE);
     const strata = new MeshBuilder(true, STONE_TILE);
+    const foliage = new MeshBuilder(true, FOLIAGE_TILE);
+    const bark = new MeshBuilder(true, BARK_TILE);
+    const leafcard = new MeshBuilder(true);
+    const pine = new MeshBuilder(true);
+    const veg: Veg = { leaf: foliage, card: leafcard, pine, bark, base: mb };
     const gx0 = data.cx * CHUNK_CELLS, gz0 = data.cz * CHUNK_CELLS;
-    granite.uvOriginX = strata.uvOriginX = gx0 * CELL;
-    granite.uvOriginZ = strata.uvOriginZ = gz0 * CELL;
+    granite.uvOriginX = strata.uvOriginX = foliage.uvOriginX = bark.uvOriginX = gx0 * CELL;
+    granite.uvOriginZ = strata.uvOriginZ = foliage.uvOriginZ = bark.uvOriginZ = gz0 * CELL;
     const N = CHUNK_CELLS;
     // 本块 + 外面一圈格子的类型（画面用）。
     // 山路格子在数据里是 Road，但画面上按原来的地面（山体/草地）画，路面另画成一条边缘参差的砂石带（trail 层），
@@ -332,7 +375,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
             const r = hash2(gx, gz, SEED + 99);
             switch (kind) {
                 case Cell.Tree:
-                    pineTree(mb, cxw, baseY, czw, 0.8 + r * 0.6, r, LEAF);
+                    treeCell(veg, gx, gz, cxw, baseY, czw, 0.8 + r * 0.6, LEAF);
                     break;
                 case Cell.Mountain: {
                     // 山上的装饰（只是画面，山体格子本来就不可走）：长草的地方有树，裸露的岩石上有大石块
@@ -344,9 +387,13 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                     const px = x0 + fx * CELL, pz = z0 + fz * CELL;
                     const py = (h00 * (1 - fx) + h10 * fx) * (1 - fz) + (h01 * (1 - fx) + h11 * fx) * fz;
                     if (cg > 0.45 && slope < 1.3 && r < 0.12 + cg * 0.33) {
-                        const leaf = shade(LEAF, 0.85 + hash2(gx, gz, SEED + 103) * 0.25);
+                        // 越高越偏黄，山顶附近有整棵变红的
+                        const autumn = smoothstep(SNOW_LINE - 16, SNOW_LINE - 4, py);
+                        const red = hash2(gx, gz, SEED + 103) < autumn * 0.7;
+                        const leaf = red ? mix(LEAF, LEAF_RED, 0.55 + autumn * 0.45)
+                            : mix(LEAF, LEAF_YELLOW, autumn * 0.85);
                         const s = (0.75 + hash2(gx, gz, SEED + 104) * 0.6) * (0.8 + cg * 0.2);
-                        pineTree(mb, px, py - 0.25 - slope * 0.3, pz, s, r, leaf);
+                        treeCell(veg, gx, gz, px, py - 0.25 - slope * 0.3, pz, s, leaf, true);
                     } else if (cg < 0.5 && r > 0.93) {
                         const bc = shade(mountainRockColor(hAvg, 0, jitter), 0.92 + jitter * 0.12);
                         mb.boulder(px, py - slope * 0.4, pz, 0.6 + hash2(gx, gz, SEED + 105) * 0.8, bc,
@@ -375,10 +422,10 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                     break;
                 }
                 case Cell.Bush:
-                    bushCell(mb, gx, gz, cxw, baseY, czw, jitter);
+                    bushCell(veg, gx, gz, cxw, baseY, czw, jitter);
                     break;
                 case Cell.Stump:
-                    mb.box(cxw, baseY, czw, 0.45, 0.3, 0.45, TRUNK, [0.75, 0.6, 0.4]);
+                    veg.bark.box(cxw, baseY, czw, 0.45, 0.3, 0.45, shade(TRUNK, TEX_GAIN), shade([0.75, 0.6, 0.4], TEX_GAIN));
                     break;
                 case Cell.Bridge: {
                     // 桥沿着道路/桥格子连得更长的方向延伸，木板横铺（垂直于桥的方向）
@@ -405,27 +452,33 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
     for (const m of trail.build()) out.push({ mesh: m, layer: "trail" });
     for (const m of granite.build()) out.push({ mesh: m, layer: "granite" });
     for (const m of strata.build()) out.push({ mesh: m, layer: "strata" });
+    for (const m of foliage.build()) out.push({ mesh: m, layer: "foliage" });
+    for (const m of bark.build()) out.push({ mesh: m, layer: "bark" });
+    for (const m of leafcard.build()) out.push({ mesh: m, layer: "leafcard" });
+    for (const m of pine.build()) out.push({ mesh: m, layer: "pine" });
     return out;
 }
 
 /**
- * 一个灌木格子（不可走，可以砍）的模型，按格子哈希从几种造型里选一种：
- * 0 圆团灌木（几团叶簇挤在一起）；1 开花的灌木；2 结红果的深色灌木；3 高草/蕨丛（一束倾斜的叶片）。
- * 叶簇是平面着色的多面体团块，底部偏暗、顶部偏亮；尺寸基本占满格子，
- * 成片的灌木格子会连成一整片树篱
+ * 一个灌木格子（不可走，可以砍）的模型，按格子哈希从四种造型里选一种：
+ * 0 圆团灌木（几团叶簇挤在一起）；1 开花的灌木；2 结红果的深色灌木；
+ * 3 蕨丛/高草（一簇从中心向外铺开的单片叶子，中间垫一小团叶簇）。
+ * 叶簇是底暗顶亮的低多边形团块；尺寸基本占满格子，成片的灌木格子会连成一整片树篱
  */
-function bushCell(mb: MeshBuilder, gx: number, gz: number, x: number, y: number, z: number, jitter: number) {
+function bushCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, jitter: number) {
     const rnd = (k: number) => (i: number) => hash2(gx * 101 + i, gz * 83 + k, SEED + 4500);
     const h = (k: number) => hash2(gx, gz, SEED + 4600 + k);
     const variant = Math.floor(h(0) * 4);
     const R = CELL * 0.5;
+    // 叶子乘树叶贴图，颜色要补偿贴图的平均亮度
+    const T = (c: RGB) => shade(c, TEX_GAIN);
     // 每格的叶色在深绿和黄绿之间变化
-    const base = mix(BUSH_DARK, BUSH, 0.55 + jitter * 0.45);
-    const light = mix(BUSH, BUSH_LIGHT, 0.4 + h(1) * 0.6);
+    const base = T(mix(BUSH_DARK, BUSH, 0.55 + jitter * 0.45));
+    const light = T(mix(BUSH, BUSH_LIGHT, 0.4 + h(1) * 0.6));
 
-    /** 一团叶簇：中心 (cx,cz)，半径 r，高 hh；顶部用亮色 */
+    /** 一团叶簇：中心 (cx,cz)，半径 r，高 hh */
     const clump = (cx: number, cz: number, r: number, hh: number, k: number, col = base, top = light) =>
-        mb.rock(cx, y, cz, r, r * (0.85 + h(40 + k) * 0.3), hh, h(50 + k) * Math.PI * 2, col, rnd(k), 1.15, top);
+        crown(v, cx, y + hh * 0.42, cz, r, hh * 0.5, r * (0.85 + h(40 + k) * 0.3), col, top, rnd(k), k === 0 ? 7 : 5);
 
     /** 叶簇外围的一圈小团，返回它们的位置，用于放花和果子 */
     const ring = (n: number, dist: number, r: number, hh: number, col?: RGB, top?: RGB) => {
@@ -449,7 +502,7 @@ function bushCell(mb: MeshBuilder, gx: number, gz: number, x: number, y: number,
             for (let i = 0; i < per; i++, k++) {
                 const a = h(60 + k) * Math.PI * 2, d = r * (0.2 + h(80 + k) * 0.5);
                 const c = cols[Math.floor(h(100 + k) * cols.length)];
-                mb.box(px + Math.cos(a) * d, py - d * 0.35, pz + Math.sin(a) * d, size, size, size, shade(c, 0.85), c);
+                v.base.box(px + Math.cos(a) * d, py - d * 0.35, pz + Math.sin(a) * d, size, size, size, shade(c, 0.85), c);
             }
         }
     };
@@ -472,8 +525,8 @@ function bushCell(mb: MeshBuilder, gx: number, gz: number, x: number, y: number,
             break;
         }
         case 2: {
-            const dark = shade(BUSH_DARK, 0.95 + jitter * 0.15);
-            const top = mix(BUSH_DARK, BUSH, 0.6);
+            const dark = T(shade(BUSH_DARK, 0.95 + jitter * 0.15));
+            const top = T(mix(BUSH_DARK, BUSH, 0.6));
             const hh = 1.0 + h(3) * 0.3;
             clump(x, z, R * 0.72, hh, 0, dark, top);
             const pts = ring(4, R * 0.55, R * 0.45, 0.8, dark, top);
@@ -482,37 +535,115 @@ function bushCell(mb: MeshBuilder, gx: number, gz: number, x: number, y: number,
             break;
         }
         default: {
-            // 高草/蕨丛：一束从中心向外倾斜的细长三棱锥叶片，中间有一小团矮叶簇垫底
-            clump(x, z, R * 0.55, 0.5, 0, base, base);
-            const n = 11 + Math.floor(h(3) * 5);
+            // 蕨丛：中间垫一小团矮叶簇，周围一圈对折的单片叶子从中心向外铺开
+            clump(x, z, R * 0.4, 0.45, 0, base, base);
+            const n = 6 + Math.floor(h(3) * 3);
             for (let k = 0; k < n; k++) {
-                const a = h(120 + k) * Math.PI * 2;
-                const d0 = R * 0.35 * h(140 + k);
-                const lean = 0.35 + h(160 + k) * 0.55;
-                const len = 1.0 + h(180 + k) * 0.9;
-                const bx = x + Math.cos(a) * d0, bz = z + Math.sin(a) * d0;
-                const tx = bx + Math.cos(a) * len * lean, tz = bz + Math.sin(a) * len * lean;
-                const ty = y + len * (1 - lean * 0.45);
-                blade(mb, bx, y - 0.05, bz, tx, ty, tz, 0.11, mix(base, light, h(200 + k)));
+                const a = (k / n) * Math.PI * 2 + h(120 + k) * 0.5;
+                const d = R * (0.75 + h(140 + k) * 0.45);
+                const tipY = y + 0.15 + h(160 + k) * 0.35;
+                v.leaf.leaf(x + Math.cos(a) * R * 0.12, y + 0.05, z + Math.sin(a) * R * 0.12,
+                    x + Math.cos(a) * d, tipY, z + Math.sin(a) * d,
+                    0.16 + h(180 + k) * 0.1, 0.12 + h(200 + k) * 0.1, mix(base, light, 0.3 + h(220 + k) * 0.7));
             }
             break;
         }
     }
 }
 
-/** 一片叶子：从底部 (bx,by,bz) 到叶尖 (tx,ty,tz) 的细三棱锥（三个侧面，四面都看得见） */
-function blade(mb: MeshBuilder, bx: number, by: number, bz: number, tx: number, ty: number, tz: number, w: number, col: RGB) {
-    const p: number[][] = [];
-    for (let i = 0; i < 3; i++) {
-        const a = (i / 3) * Math.PI * 2;
-        p.push([bx + Math.cos(a) * w, by, bz + Math.sin(a) * w]);
+/**
+ * 一棵树，按格子哈希从四种造型里选一种：
+ * 0 松树（树干 + 五层松枝裙摆，下沿由松枝贴图裁成参差的枝梢）；1 阔叶树（主干分出三根枝，四团叶簇）；
+ * 2 红叶树（浅色树干分出三根枝，五团红叶）；3 棕榈（两节弯曲的树干 + 七片弧形长叶）。
+ * 叶子画在 foliage 层（树叶贴图），树干树枝画在 bark 层（树皮贴图）。
+ * 高度 4~6 米。s 是整体缩放，leaf 是基础叶色，mountain 为 true 时不出棕榈、红叶树用传入的秋色
+ */
+function treeCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, s: number, leaf: RGB, mountain = false) {
+    const rnd = (k: number) => (i: number) => hash2(gx * 73 + i, gz * 59 + k, SEED + 4300);
+    const h = (k: number) => hash2(gx, gz, SEED + 4400 + k);
+    const rot = h(1) * Math.PI * 2;
+    // 平地：松树 35%、阔叶树 35%、红叶树 18%、棕榈 12%；山上没有棕榈
+    const p = h(0);
+    const variant = mountain ? (p < 0.55 ? 0 : p < 0.8 ? 1 : 2) : (p < 0.35 ? 0 : p < 0.7 ? 1 : p < 0.88 ? 2 : 3);
+    // 叶子和树干乘贴图，颜色要补偿贴图的平均亮度
+    const T = (c: RGB, f = 1) => shade(c, f * TEX_GAIN);
+    const trunk = T(TRUNK, 0.9 + h(2) * 0.2);
+    /** 从 (bx,by,bz) 往方位角 a 伸出一根树枝，水平伸出 out、升高 up，返回枝梢 */
+    const branch = (bx: number, by: number, bz: number, a: number, out: number, up: number, r0: number, col: RGB) => {
+        const ex = bx + Math.cos(a) * out * s, ey = by + up * s, ez = bz + Math.sin(a) * out * s;
+        v.bark.prism(bx, by, bz, r0 * s, ex, ey, ez, r0 * 0.45 * s, col, 4, a);
+        return [ex, ey, ez];
+    };
+    /** 一团叶簇：中心 c，水平半径 r、竖直半径 ry */
+    const clump = (c: number[], r: number, ry: number, col: RGB, top: RGB, k: number) =>
+        crown(v, c[0], c[1], c[2], r * s, ry * s, r * (0.85 + h(10 + k) * 0.3) * s, col, top, rnd(k), r > 1.1 ? 12 : 9);
+
+    if (variant === 0) {
+        // 松树：树干下面露出一截，上面五层往下垂的松枝裙摆，一层压一层、越往上越小，最上面收成尖顶。
+        // 每层的下沿由松枝贴图裁成参差的枝梢，从缝隙里能看到下一层和树干
+        v.bark.prism(x, y, z, 0.22 * s, x, y + 3.6 * s, z, 0.06 * s, trunk, 5, rot);
+        const TIERS = 5;
+        for (let k = 0; k < TIERS; k++) {
+            const t = k / (TIERS - 1);
+            const rBot = 1.5 * (1 - t * 0.7) * (0.92 + h(60 + k) * 0.16) * s;
+            const yBot = y + (0.75 + k * 0.85) * s;
+            const yTop = yBot + (1.5 - t * 0.4) * s;
+            v.pine.skirt(x, yTop, z, k === TIERS - 1 ? 0 : rBot * 0.2, yBot, rBot, T(leaf, 0.85 + t * 0.35),
+                8, rot + k * 0.9, k < 2 ? 2 : 1);
+        }
+        return;
     }
-    // 参考点取在叶片轴线中点，法线朝外
-    const rx = (bx + tx) / 2, ry = (by + ty) / 2, rz = (bz + tz) / 2;
-    for (let i = 0; i < 3; i++) {
-        const a = p[i], b = p[(i + 1) % 3];
-        const c = shade(col, 0.88 + i * 0.1);
-        mb.tri(a[0], a[1], a[2], b[0], b[1], b[2], tx, ty, tz, c, rx, ry, rz);
+    if (variant === 1) {
+        // 阔叶树：粗短的树干分出两根斜枝，主干继续往上；枝梢各顶一团叶簇，下面再垫一团，树冠宽而蓬松
+        const top = y + 1.6 * s;
+        v.bark.prism(x, y, z, 0.3 * s, x, top, z, 0.18 * s, trunk, 6, rot);
+        const col = T(leaf), light = T(mix(leaf, LEAF_LIGHT, 0.55));
+        const tips = [
+            branch(x, top, z, rot, 0.15, 1.2, 0.18, trunk),
+            branch(x, top - 0.2 * s, z, rot + 2.3, 1.0, 0.9, 0.14, trunk),
+            branch(x, top - 0.1 * s, z, rot + 4.2, 0.9, 1.0, 0.13, trunk),
+        ];
+        clump([tips[0][0], tips[0][1] + 0.5 * s, tips[0][2]], 1.35, 1.0, col, light, 0);
+        clump(tips[1], 1.0, 0.8, col, light, 1);
+        clump(tips[2], 0.95, 0.75, col, light, 2);
+        const a = rot + 1.2;
+        clump([x + Math.cos(a) * 0.7 * s, top + 0.9 * s, z + Math.sin(a) * 0.7 * s], 0.9, 0.7, shade(col, 0.9), light, 3);
+        return;
+    }
+    if (variant === 2) {
+        // 红叶树：浅色的高树干在 2/3 处分成三根枝，树冠是好几团红叶，又宽又高
+        const bark = T([0.62, 0.50, 0.40], 0.92 + h(3) * 0.16);
+        const top = y + 2.2 * s;
+        v.bark.prism(x, y, z, 0.32 * s, x, top, z, 0.2 * s, bark, 6, rot);
+        // 平地上的红叶树偏橙红，山上的直接用传进来的秋色
+        const red = mountain ? leaf : mix(LEAF_RED, LEAF_YELLOW, h(4) * 0.35);
+        const col = T(red, 0.92), light = T(mix(red, LEAF_YELLOW, 0.3), 1.05);
+        for (let k = 0; k < 3; k++) {
+            const tip = branch(x, top, z, rot + k * 2.1 + (h(20 + k) - 0.5) * 0.6, 1.0 + h(30 + k) * 0.3, 1.1 + h(40 + k) * 0.4, 0.15, bark);
+            clump(tip, 1.05, 0.8, col, light, k);
+        }
+        clump([x, top + 2.0 * s, z], 1.25, 0.95, col, light, 3);
+        const a = rot + 1.05;
+        clump([x + Math.cos(a) * 0.9 * s, top + 1.6 * s, z + Math.sin(a) * 0.9 * s], 0.9, 0.7, col, light, 4);
+        return;
+    }
+    // 棕榈：两节往一边弯的细树干，顶上七片弧形长叶，中间一小团深色的果子
+    const bark = T(TRUNK, 1.2);
+    const a0 = rot;
+    const mx = x + Math.cos(a0) * 0.25 * s, mz = z + Math.sin(a0) * 0.25 * s, my = y + 2.2 * s;
+    const tx = x + Math.cos(a0) * 0.8 * s, tz = z + Math.sin(a0) * 0.8 * s, ty = y + 4.3 * s;
+    v.bark.prism(x, y, z, 0.2 * s, mx, my, mz, 0.15 * s, bark, 5, rot);
+    v.bark.prism(mx, my, mz, 0.15 * s, tx, ty, tz, 0.11 * s, bark, 5, rot);
+    v.leaf.blob(tx, ty - 0.1 * s, tz, 0.3 * s, 0.25 * s, 0.3 * s, T(TRUNK, 0.8), T(TRUNK), rnd(9), 4);
+    // 七片长叶：每片是一整条先上扬再下垂的弧形叶片；一高一低交替，树冠上下有层次
+    for (let k = 0; k < 7; k++) {
+        const a = rot + (k / 7) * Math.PI * 2 + (h(50 + k) - 0.5) * 0.4;
+        const high = (k & 1) === 1;
+        const len = (high ? 1.5 : 2.0) * (0.9 + h(20 + k) * 0.25) * s;
+        const rise = (high ? 0.75 : 0.4) * s;
+        const droop = (high ? 0.1 : 0.7 + h(30 + k) * 0.5) * s;
+        v.leaf.frond(tx, ty, tz, Math.cos(a), Math.sin(a), len, rise, droop, 0.34 * s,
+            T(LEAF_LIGHT, (high ? 0.95 : 0.8) + h(40 + k) * 0.2));
     }
 }
 
@@ -714,13 +845,6 @@ function gravelQuad(gravel: MeshBuilder, lx: number, lz: number, x0: number, z0:
         [u0, v0, u1, v0, u1, v1, u0, v1]);
 }
 
-/** 松树：树干 + 两层树冠 */
-function pineTree(mb: MeshBuilder, x: number, y: number, z: number, s: number, r: number, leaf: RGB) {
-    mb.box(x, y, z, 0.35 * s, 1.2 * s, 0.35 * s, TRUNK);
-    mb.cone(x, y + 1.0 * s, z, 1.0 * s, 2.4 * s, leaf, 6, r * 3);
-    mb.cone(x, y + 2.0 * s, z, 0.7 * s, 1.8 * s, shade(leaf, 1.15), 6, r * 5);
-}
-
 /**
  * 山体格子的岩石 UV（顶点顺序 00-10-11-01）。按格子朝向选投影面：
  * 缓坡从上往下投影 (x,z)；陡坡投影到侧面 (水平, 高度)，悬崖上的纹理不会被拉长，岩层是横向的。
@@ -853,6 +977,18 @@ function cutoutMaterial(tex: Laya.BaseTexture): Laya.BlinnPhongMaterial {
     return m;
 }
 
+/** 叶簇面片 / 松枝材质：alpha 测试裁出叶片轮廓，双面显示（从背面、从下面也要看得见） */
+function leafCardMaterial(tex: Laya.BaseTexture): Laya.BlinnPhongMaterial {
+    const m = terrainMaterial(tex);
+    m.lock = false;
+    m.materialRenderMode = Laya.MaterialRenderMode.RENDERMODE_CUTOUT;
+    // 远处贴图缩小后 alpha 被平均变淡，阈值低一点，远看树冠不会变稀
+    m.alphaTestValue = 0.35;
+    m.cull = Laya.RenderState.CULL_NONE;
+    m.lock = true;
+    return m;
+}
+
 /** 地形和水面共用的材质（游戏运行和编辑器预览共用） */
 export function createWorldMaterials(): WorldMaterials {
     const water = createWaterMaterial();
@@ -868,6 +1004,10 @@ export function createWorldMaterials(): WorldMaterials {
             trail: cutoutMaterial(trailTexture()),
             granite: terrainMaterial(graniteTexture()),
             strata: terrainMaterial(strataTexture()),
+            foliage: terrainMaterial(foliageTexture()),
+            bark: terrainMaterial(barkTexture()),
+            leafcard: leafCardMaterial(leafCardTexture()),
+            pine: leafCardMaterial(pineTexture()),
         },
         water,
     };

@@ -444,6 +444,231 @@ export function trailTexture(): Laya.Texture2D {
     return trailTex;
 }
 
+/**
+ * 树叶（树冠、灌木用）：叠在一起的一层层小叶片。每片是带尖的椭圆，上沿受光、下沿暗，
+ * 中间一条叶脉，叶片下方有一圈接触阴影，叶片之间的缝隙是暗的。整体接近白色，叶色由顶点色决定
+ */
+function foliagePixels(): Float32Array {
+    const buf = new Float32Array(SIZE * SIZE * 3);
+    for (let p = 0; p < SIZE * SIZE; p++) {
+        const v = 0.5 + 0.08 * hash2(p % SIZE, Math.floor(p / SIZE), SEED + 3700);
+        buf[p * 3] = v; buf[p * 3 + 1] = v; buf[p * 3 + 2] = v * 0.9;
+    }
+    const LEAVES = 1800;
+    for (let b = 0; b < LEAVES; b++) {
+        const h = (k: number) => hash2(b, k, SEED + 3750);
+        const cx = h(1) * SIZE, cy = h(2) * SIZE;
+        const r = 4.5 + h(3) * 4;              // 叶片半长（像素）
+        const w = r / (1.6 + h(4) * 0.5);      // 半宽
+        // 叶尖大致朝下（像垂下来的叶子），左右偏转
+        const a = Math.PI / 2 + (h(5) - 0.5) * 1.8;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const tone = 0.86 + h(6) * 0.3;
+        const warm = h(7) - 0.5;
+        const R = Math.ceil(r) + 2;
+        for (let j = -R; j <= R; j++) {
+            for (let i = -R; i <= R; i++) {
+                const px = ((Math.round(cx) + i) % SIZE + SIZE) % SIZE, py = ((Math.round(cy) + j) % SIZE + SIZE) % SIZE;
+                const k = (py * SIZE + px) * 3;
+                const lu = (i * ca + j * sa) / r, lv = (-i * sa + j * ca) / w;
+                // 带尖的叶形：越靠叶尖（lu → 1）越窄
+                const taper = 1 - Math.max(0, lu) * 0.55;
+                const d2 = lu * lu + (lv / taper) * (lv / taper);
+                if (d2 > 1) {
+                    // 叶片下方偏右的接触阴影
+                    const su = ((i - 1.5) * ca + (j - 2) * sa) / r, sv = (-(i - 1.5) * sa + (j - 2) * ca) / w;
+                    if (su * su + sv * sv <= 1.15) { buf[k] *= 0.8; buf[k + 1] *= 0.8; buf[k + 2] *= 0.8; }
+                    continue;
+                }
+                // 上方受光，边缘暗一点，中间有叶脉
+                let lum = tone * (0.95 - 0.22 * (j / R) + 0.12 * (1 - d2));
+                if (Math.abs(lv) < 0.14 && lu > -0.8) lum *= 0.9;
+                lum *= 0.95 + 0.1 * hash2(px, py, SEED + 3800);
+                buf[k] = lum * (1 + warm * 0.12);
+                buf[k + 1] = lum;
+                buf[k + 2] = lum * (0.88 - warm * 0.1);
+            }
+        }
+    }
+    return buf;
+}
+
+/** 树皮：v 方向（树干的高度方向）拉长的竖向沟纹 + 横向的裂口 + 零星的节疤 */
+function barkPixels(): Float32Array {
+    const buf = new Float32Array(SIZE * SIZE * 3);
+    for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+            const u = x / SIZE, v = y / SIZE;
+            const warp = pfbm(u, v, 4, 2, 3, SEED + 3900);
+            // 竖向沟纹：横向周期 16（整数，无缝），被噪声扭曲
+            const ridge = 0.5 + 0.5 * Math.sin((u * 16 + (warp - 0.5) * 1.6) * Math.PI * 2);
+            let lum = 0.7 + 0.3 * Math.pow(ridge, 0.6);
+            lum *= 0.85 + 0.25 * pfbm(u, v, 24, 4, 3, SEED + 3950);
+            // 横向裂口
+            const crack = pfbm(u, v, 16, 32, 2, SEED + 4000);
+            if (crack > 0.7 && ridge > 0.4) lum *= 0.7;
+            lum *= 0.92 + 0.16 * hash2(x, y, SEED + 4050);
+            const i = (y * SIZE + x) * 3;
+            buf[i] = lum * 1.05; buf[i + 1] = lum; buf[i + 2] = lum * 0.92;
+        }
+    }
+    // 节疤：深色椭圆环
+    for (let b = 0; b < 10; b++) {
+        const cx = hash2(b, 1, SEED + 4080) * SIZE, cy = hash2(b, 2, SEED + 4080) * SIZE;
+        const r = 4 + hash2(b, 3, SEED + 4080) * 5;
+        for (let j = -2 * r; j <= 2 * r; j++)
+            for (let i = -r; i <= r; i++) {
+                const d = Math.hypot(i / r, j / (2 * r));
+                if (d > 1) continue;
+                const px = ((Math.round(cx) + i) % SIZE + SIZE) % SIZE, py = ((Math.round(cy + j)) % SIZE + SIZE) % SIZE;
+                const k = (py * SIZE + px) * 3;
+                const f = d < 0.35 ? 0.55 : d > 0.75 ? 0.75 : 0.9;
+                buf[k] *= f; buf[k + 1] *= f; buf[k + 2] *= f;
+            }
+    }
+    return buf;
+}
+
+/** 一张树皮贴图覆盖的边长（米） */
+export const BARK_TILE = 1;
+let barkTex: Laya.Texture2D | null = null;
+
+export function barkTexture(): Laya.Texture2D {
+    if (!barkTex || barkTex.destroyed) barkTex = makeTexture(toRGBA(barkPixels()));
+    return barkTex;
+}
+
+/**
+ * 叶簇面片贴图（树冠、灌木用）：2×2 共四种叶簇，每种是十几片从中心向外伸出的尖叶，
+ * 叶片以外是透明的（alpha 测试裁掉），所以面片的轮廓是参差的叶尖而不是方块。
+ * 外圈的叶子先画、偏暗，里圈的后画、偏亮；每片有叶脉和暗边，叶片之间分得开
+ */
+function leafCardPixels(): { rgb: Float32Array; alpha: Float32Array } {
+    // 透明处的颜色填成叶子的平均亮度，缩小（mipmap）后边缘不会发黑
+    const rgb = new Float32Array(SIZE * SIZE * 3).fill(0.8);
+    const alpha = new Float32Array(SIZE * SIZE);
+    const C = SIZE / 2;
+    const N = 15;
+    for (let cell = 0; cell < 4; cell++) {
+        const ox = (cell & 1) * C + C / 2, oy = (cell >> 1) * C + C / 2;
+        // 每片叶子：离中心的距离 d（第 0 片在正中，保证中心不透明），按 d 从外到里画
+        const order: number[] = [];
+        const dist: number[] = [];
+        for (let i = 0; i < N; i++) {
+            order.push(i);
+            dist.push(i === 0 ? 0 : 9 + hash2(cell * 64 + i, 1, SEED + 3850) * 25);
+        }
+        order.sort((a, b) => dist[b] - dist[a]);
+        for (const i of order) {
+            const h = (k: number) => hash2(cell * 64 + i, k, SEED + 3850);
+            const d = dist[i];
+            const a = i * 2.4 + h(2) * 0.8;          // 叶尖朝外
+            const ca = Math.cos(a), sa = Math.sin(a);
+            const r = 17 + h(3) * 8;                 // 半长（像素）；d + r ≤ 59 < 64，不会画出格子
+            const w = r / (1.9 + h(4) * 0.5);        // 半宽
+            const tone = (0.78 + 0.26 * (1 - d / 34)) * (0.92 + 0.16 * h(5));
+            const warm = h(6) - 0.5;
+            const cx = Math.round(ox + ca * d), cy = Math.round(oy + sa * d);
+            const R = Math.ceil(r) + 1;
+            for (let j = -R; j <= R; j++) {
+                for (let ii = -R; ii <= R; ii++) {
+                    const lu = (ii * ca + j * sa) / r, lv = (-ii * sa + j * ca) / w;
+                    const taper = 1 - Math.max(0, lu) * 0.6;   // 越靠叶尖越窄
+                    const d2 = lu * lu + (lv / taper) * (lv / taper);
+                    if (d2 > 1) continue;
+                    let lum = tone * (0.84 + 0.2 * (1 - d2)) * (1 + 0.1 * lu);
+                    if (Math.abs(lv) < 0.12) lum *= 0.86;      // 叶脉
+                    if (d2 > 0.72) lum *= 0.8;                 // 暗边
+                    const p = (cy + j) * SIZE + cx + ii;
+                    rgb[p * 3] = lum * (1 + warm * 0.12);
+                    rgb[p * 3 + 1] = lum;
+                    rgb[p * 3 + 2] = lum * (0.88 - warm * 0.1);
+                    alpha[p] = 1;
+                }
+            }
+        }
+    }
+    return { rgb, alpha };
+}
+
+/**
+ * 松枝贴图（松树每一层枝叶的“裙摆”用）：u 绕树一圈（左右无缝），v 从上（0）到下（1）。
+ * 四排一层压一层往下垂的松枝，每枝是尖头朝下的一簇针叶：枝梢亮（新叶）、被上一排盖住的地方暗，
+ * 中间有枝条，两侧是一根根横向探出的针叶。最下面一排枝梢之间是透明的（alpha 测试裁掉），
+ * 所以每层枝叶的下沿是参差的松枝，而不是一条直边
+ */
+function pinePixels(): { rgb: Float32Array; alpha: Float32Array } {
+    const rgb = new Float32Array(SIZE * SIZE * 3).fill(0.75);
+    const alpha = new Float32Array(SIZE * SIZE);
+    const ROWS = 4, TEETH = 7;
+    for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+            const u = x / SIZE, v = y / SIZE;
+            let lum = -1;
+            // 从最下面一排画到最上面一排，上面的盖住下面的
+            for (let r = ROWS - 1; r >= 0; r--) {
+                const rowTip = (r + 1) / ROWS - 0.02;
+                for (let k = 0; k < TEETH; k++) {
+                    const h = (i: number) => hash2(r * 16 + k, i, SEED + 3880);
+                    const uc = (k + 0.5 + (h(1) - 0.5) * 0.5) / TEETH;
+                    const tip = rowTip - h(2) * 0.07;
+                    if (v > tip) continue;
+                    const len = 0.2 + h(3) * 0.08;
+                    const t = Math.min(1, (tip - v) / len);          // 0 = 枝梢，1 = 枝根
+                    let du = u - uc;
+                    du -= Math.round(du);                             // 左右无缝
+                    // 针叶：每隔两行像素一根，长短不一，边缘是锯齿
+                    const needle = 0.7 + 0.5 * hash2(y >> 1, r * 16 + k, SEED + 3890);
+                    const hw = (0.8 / TEETH) * Math.pow(t, 0.75) * needle;
+                    const ad = Math.abs(du);
+                    if (ad > hw) continue;
+                    const streak = hash2(y >> 1, x >> 2, SEED + 3895);  // 横向的针叶明暗
+                    let l = (1.2 - 0.6 * t) * (0.8 + 0.4 * streak) * (0.9 + 0.2 * h(4));
+                    if (ad < 0.006) l *= 0.6;                         // 枝条
+                    else if (hw > 0 && ad / hw > 0.75) l *= 1.1;      // 针叶尖亮一点
+                    // 被上一排盖住的地方（枝根以上）是阴影
+                    if ((tip - v) > len) l *= 0.6;
+                    lum = l;
+                }
+            }
+            if (lum < 0) continue;
+            const p = y * SIZE + x;
+            rgb[p * 3] = lum * 0.94; rgb[p * 3 + 1] = lum; rgb[p * 3 + 2] = lum * 0.96;
+            alpha[p] = 1;
+        }
+    }
+    return { rgb, alpha };
+}
+
+let pineTex: Laya.Texture2D | null = null;
+
+export function pineTexture(): Laya.Texture2D {
+    if (!pineTex || pineTex.destroyed) {
+        const p = pinePixels();
+        pineTex = makeTexture(toRGBA(p.rgb, p.alpha));
+    }
+    return pineTex;
+}
+
+let leafCardTex: Laya.Texture2D | null = null;
+
+export function leafCardTexture(): Laya.Texture2D {
+    if (!leafCardTex || leafCardTex.destroyed) {
+        const p = leafCardPixels();
+        leafCardTex = makeTexture(toRGBA(p.rgb, p.alpha));
+    }
+    return leafCardTex;
+}
+
+/** 一张树叶贴图覆盖的边长（米），树冠用法线投影 UV */
+export const FOLIAGE_TILE = 2.5;
+let foliageTex: Laya.Texture2D | null = null;
+
+export function foliageTexture(): Laya.Texture2D {
+    if (!foliageTex || foliageTex.destroyed) foliageTex = makeTexture(toRGBA(foliagePixels()));
+    return foliageTex;
+}
+
 let grassTex: Laya.Texture2D | null = null;
 let plankTex: Laya.Texture2D | null = null;
 let sandTex: Laya.Texture2D | null = null;

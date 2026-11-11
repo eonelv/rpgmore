@@ -194,6 +194,146 @@ export class MeshBuilder {
         }
     }
 
+    /**
+     * 树干/树枝：从底面中心 (ax,ay,az) 到顶面中心 (bx,by,bz) 的棱台，只画侧面（sides×2 个三角形）。
+     * 截面是水平的，适合往上长、略微倾斜的枝干
+     */
+    prism(ax: number, ay: number, az: number, r0: number, bx: number, by: number, bz: number, r1: number,
+        col: RGB, sides = 4, phase = 0) {
+        const ref = [(ax + bx) / 2, (ay + by) / 2, (az + bz) / 2];
+        for (let i = 0; i < sides; i++) {
+            const a0 = phase + (i / sides) * Math.PI * 2, a1 = phase + ((i + 1) / sides) * Math.PI * 2;
+            const c0 = Math.cos(a0), s0 = Math.sin(a0), c1 = Math.cos(a1), s1 = Math.sin(a1);
+            this.quad([ax + c0 * r0, ay, az + s0 * r0], [ax + c1 * r0, ay, az + s1 * r0],
+                [bx + c1 * r1, by, bz + s1 * r1], [bx + c0 * r1, by, bz + s0 * r1], col, ref);
+        }
+    }
+
+    /**
+     * 低多边形叶团（树冠、灌木）：底尖 + 两圈错开的扭曲顶点 + 顶尖，共 seg×4 个三角形。
+     * (x,yc,z) 是中心，rx/ry/rz 是三个方向的半径；底面偏暗，顶面用 topCol
+     */
+    blob(x: number, yc: number, z: number, rx: number, ry: number, rz: number, col: RGB, topCol: RGB,
+        rand: (i: number) => number, seg = 5) {
+        const rot = rand(0) * Math.PI * 2;
+        const ring = (l: number, y: number, r: number) => {
+            const out: number[][] = [];
+            for (let i = 0; i < seg; i++) {
+                const a = rot + ((i + l * 0.5) / seg) * Math.PI * 2;
+                const j = r * (0.84 + rand(1 + l * seg + i) * 0.32);
+                out.push([x + Math.cos(a) * rx * j, yc + ry * (y + (rand(20 + l * seg + i) - 0.5) * 0.2), z + Math.sin(a) * rz * j]);
+            }
+            return out;
+        };
+        const L = ring(0, -0.28, 1.0), U = ring(1, 0.38, 0.8);
+        const bot = [x, yc - ry * 0.8, z];
+        const top = [x + (rand(40) - 0.5) * rx * 0.3, yc + ry, z + (rand(41) - 0.5) * rz * 0.3];
+        let k = 0;
+        const face = (c: RGB, f: number) => {
+            f *= 0.9 + rand(50 + k++) * 0.18;
+            return [Math.min(1, c[0] * f), Math.min(1, c[1] * f), Math.min(1, c[2] * f)] as RGB;
+        };
+        const T = (p: number[], q: number[], s: number[], c: RGB) =>
+            this.tri(p[0], p[1], p[2], q[0], q[1], q[2], s[0], s[1], s[2], c, x, yc, z);
+        for (let i = 0; i < seg; i++) {
+            const n = (i + 1) % seg, p = (i + seg - 1) % seg;
+            T(bot, L[i], L[n], face(col, 0.72));
+            T(L[i], L[n], U[i], face(col, 1));
+            T(L[i], U[i], U[p], face(topCol, 0.92));
+            T(U[i], U[n], top, face(topCol, 1.05));
+        }
+    }
+
+    /**
+     * 松树的一层枝叶：一圈上小下大的“裙摆”（圆台侧面），配合松枝贴图（双面、alpha 测试）：
+     * 贴图的 u 绕一圈重复 uRep 次，v 从上沿到下沿，下沿被贴图裁成参差的松枝。slices×2 个三角形
+     */
+    skirt(x: number, yTop: number, z: number, rTop: number, yBot: number, rBot: number, col: RGB,
+        slices: number, phase: number, uRep: number) {
+        const ref = [x, (yTop + yBot) / 2, z];
+        for (let i = 0; i < slices; i++) {
+            const a0 = phase + (i / slices) * Math.PI * 2, a1 = phase + ((i + 1) / slices) * Math.PI * 2;
+            const c0 = Math.cos(a0), s0 = Math.sin(a0), c1 = Math.cos(a1), s1 = Math.sin(a1);
+            const u0 = (i / slices) * uRep, u1 = ((i + 1) / slices) * uRep;
+            this.quad([x + c0 * rTop, yTop, z + s0 * rTop], [x + c1 * rTop, yTop, z + s1 * rTop],
+                [x + c1 * rBot, yBot, z + s1 * rBot], [x + c0 * rBot, yBot, z + s0 * rBot], col, ref,
+                [u0, 0.02, u1, 0.02, u1, 0.98, u0, 0.98]);
+        }
+    }
+
+    /**
+     * 一片对折的叶子（中脉凸起，从上面和侧面都看得见）：叶柄在 (bx,by,bz)，叶尖在 (tx,ty,tz)，
+     * 最宽处半宽 w、离叶柄 45%，arch 是最宽处往上拱的高度。4 个三角形
+     */
+    leaf(bx: number, by: number, bz: number, tx: number, ty: number, tz: number, w: number, arch: number, col: RGB) {
+        let dx = tx - bx, dz = tz - bz;
+        const len = Math.hypot(dx, dz) || 1;
+        dx /= len; dz /= len;
+        const mx = bx + (tx - bx) * 0.45, my = by + (ty - by) * 0.45 + arch, mz = bz + (tz - bz) * 0.45;
+        const fold = w * 0.35;
+        const lx = mx - dz * w, lz = mz + dx * w, rx = mx + dz * w, rz = mz - dx * w;
+        const ly = my - fold;
+        // 参考点在叶子正下方很远处 => 法线朝上
+        const qy = my - 100;
+        const lc = col, dc: RGB = [col[0] * 0.86, col[1] * 0.86, col[2] * 0.86];
+        this.tri(bx, by, bz, lx, ly, lz, mx, my, mz, lc, mx, qy, mz);
+        this.tri(lx, ly, lz, tx, ty, tz, mx, my, mz, lc, mx, qy, mz);
+        this.tri(bx, by, bz, mx, my, mz, rx, ly, rz, dc, mx, qy, mz);
+        this.tri(mx, my, mz, tx, ty, tz, rx, ly, rz, dc, mx, qy, mz);
+    }
+
+    /**
+     * 棕榈的一片长叶：从叶柄 (bx,by,bz) 沿水平方向 (ca,sa) 伸出 len，先上扬 rise 再下垂到叶柄以下 droop，
+     * 是一整条连续的弧形叶片（3 段，叶柄窄、中间最宽、叶尖收尖），沿中脉对折。
+     * 正反两面都画（背面法线朝下、自然偏暗），从树下往上看也看得见。共 20 个三角形
+     */
+    frond(bx: number, by: number, bz: number, ca: number, sa: number, len: number, rise: number, droop: number,
+        w: number, col: RGB) {
+        const T = [0, 0.3, 0.65, 1], W = [0.3, 1, 0.8, 0];
+        const spine: number[][] = [], left: number[][] = [], right: number[][] = [];
+        for (let i = 0; i < 4; i++) {
+            const t = T[i], hw = W[i] * w;
+            const px = bx + ca * len * t, pz = bz + sa * len * t;
+            const py = by + 4 * rise * t * (1 - t) - droop * t * t;
+            spine.push([px, py, pz]);
+            left.push([px - sa * hw, py - hw * 0.4, pz + ca * hw]);
+            right.push([px + sa * hw, py - hw * 0.4, pz - ca * hw]);
+        }
+        const dark: RGB = [col[0] * 0.85, col[1] * 0.85, col[2] * 0.85];
+        const both = (p: number[], q: number[], r: number[], c: RGB) => {
+            // 参考点在正下方 => 朝上的一面；在正上方 => 朝下的一面
+            this.tri(p[0], p[1], p[2], q[0], q[1], q[2], r[0], r[1], r[2], c, p[0], p[1] - 100, p[2]);
+            this.tri(p[0], p[1], p[2], q[0], q[1], q[2], r[0], r[1], r[2], c, p[0], p[1] + 100, p[2]);
+        };
+        for (let i = 0; i < 3; i++) {
+            both(spine[i], spine[i + 1], left[i], col);
+            both(spine[i], spine[i + 1], right[i], dark);
+            if (i < 2) {
+                both(left[i], spine[i + 1], left[i + 1], col);
+                both(right[i], spine[i + 1], right[i + 1], dark);
+            }
+        }
+    }
+
+    /**
+     * 叶簇面片（配合双面、alpha 测试的材质）：中心 p，沿 u、v 两个单位方向各伸出 half 的方片，2 个三角形。
+     * 法线由调用方给（一般取树冠中心往外的方向，整个树冠的明暗像一个球，不会一片亮一片暗）；
+     * cell 是 2×2 图集里的第几格
+     */
+    card(p: number[], u: number[], v: number[], half: number, n: number[], col: RGB, cell: number) {
+        if (this.count + 6 > MAX_VERTS) this.flush();
+        const u0 = (cell & 1) * 0.5 + 0.004, v0 = ((cell >> 1) & 1) * 0.5 + 0.004, d = 0.492;
+        const out = this.verts;
+        const vert = (su: number, sv: number) => {
+            out.push(p[0] + (u[0] * su + v[0] * sv) * half, p[1] + (u[1] * su + v[1] * sv) * half,
+                p[2] + (u[2] * su + v[2] * sv) * half, n[0], n[1], n[2], col[0], col[1], col[2], 1);
+            if (this.withUV) out.push(u0 + (su + 1) * 0.5 * d, v0 + (sv + 1) * 0.5 * d);
+        };
+        vert(-1, -1); vert(1, -1); vert(1, 1);
+        vert(-1, -1); vert(1, 1); vert(-1, 1);
+        this.count += 6;
+    }
+
     get vertexCount() { return this.count; }
 
     private flush() {
