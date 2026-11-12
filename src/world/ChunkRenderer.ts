@@ -1,4 +1,4 @@
-import { hash2, fbm } from "./Noise";
+import { hash2, fbm, valueNoise } from "./Noise";
 import { createWaterMaterial } from "./WaterShader";
 import { MeshBuilder, RGB } from "./MeshBuilder";
 import {
@@ -7,8 +7,9 @@ import {
 } from "./TerrainTextures";
 import { CELL, CHUNK_CELLS, CHUNK_SIZE, Cell, SEED } from "./WorldConfig";
 import {
-    ChunkData, MOUNTAIN_TRAIL_HALF, WATER_Y, WALK_MIN_Y, chunkHasMountainTrail, mountainTrailDistance, onRegularRoad,
-    terrainHeight, trailGroundKind,
+    ChunkData, MOUNTAIN_TRAIL_HALF, SAND_NOISE, WATER_NOISE, WATER_Y, WALK_MIN_Y, chunkHasMountainTrail,
+    mountainTrailDistance, onRegularRoad,
+    terrainHeight, terrainNoise, trailGroundKind,
 } from "./WorldGen";
 
 export const COLORS: Record<number, RGB> = {
@@ -54,6 +55,19 @@ function mountainRockColor(h: number, slope: number, jitter: number): RGB {
     const snow = (h - SNOW_LINE + jitter * 4) / 3 - slope * 0.8;
     return mix(c, SNOW, snow);
 }
+
+/** 山体格子每边细分的段数：寻路格子 2 米，山体网格 1 米 */
+const MTN_SUB = 2;
+/** 山体细分网格的间距（米） */
+const MTN_STEP = CELL / MTN_SUB;
+
+/**
+ * 山体表面的岩石起伏 [-1,1)：两层噪声（波长 6 米、3 米），叠加在地形高度上。
+ * 是世界坐标的函数，相邻块在共享边上算出同样的值，没有接缝
+ */
+function mountainDetail(wx: number, wz: number): number {
+    return fbm(wx / 6, wz / 6, 2, SEED + 1300) * 2 - 1;
+}
 const TRUNK: RGB = [0.40, 0.27, 0.16];
 const LEAF: RGB = [0.16, 0.42, 0.20];
 const LEAF_LIGHT: RGB = [0.42, 0.62, 0.24];
@@ -92,8 +106,11 @@ function shade(c: RGB, f: number): RGB {
 export type TerrainLayer = "base" | "grass" | "sand" | "plank" | "rock" | "gravel" | "trail" | "granite" | "strata"
     | "foliage" | "bark" | "leafcard" | "pine";
 
-/** 树和灌木用的网格：叶团内核（树叶贴图）、叶簇面片（双面裁切）、松枝（双面裁切）、树干（树皮贴图）、花和果子（纯顶点色） */
-interface Veg { leaf: MeshBuilder; card: MeshBuilder; pine: MeshBuilder; bark: MeshBuilder; base: MeshBuilder }
+/**
+ * 树和灌木用的网格：叶团内核（树叶贴图）、叶簇面片（双面裁切）、松枝（双面裁切）、树干（树皮贴图）、花和果子（纯顶点色）。
+ * far = true 是远处的块：叶簇面片数量减半（单片放大补上）、松枝切面减少、不画花和果子
+ */
+interface Veg { leaf: MeshBuilder; card: MeshBuilder; pine: MeshBuilder; bark: MeshBuilder; base: MeshBuilder; far: boolean }
 
 /**
  * 一团树冠 / 灌木叶簇：里面一个偏暗的小叶团做内核（挡住视线，不会看穿），
@@ -103,6 +120,9 @@ interface Veg { leaf: MeshBuilder; card: MeshBuilder; pine: MeshBuilder; bark: M
 function crown(v: Veg, x: number, yc: number, z: number, rx: number, ry: number, rz: number,
     col: RGB, top: RGB, rand: (i: number) => number, cards: number) {
     v.leaf.blob(x, yc, z, rx * 0.7, ry * 0.7, rz * 0.7, shade(col, 0.62), shade(col, 0.8), rand, 5);
+    // 远处：面片数量减半，单片放大一些，树冠的轮廓大小不变
+    const grow = v.far ? 1.3 : 1;
+    if (v.far) cards = Math.ceil(cards / 2);
     const rot = rand(100) * Math.PI * 2;
     for (let i = 0; i < cards; i++) {
         // 在球面上均匀撒点（上面多、底下不放）
@@ -117,7 +137,7 @@ function crown(v: Veg, x: number, yc: number, z: number, rx: number, ry: number,
         const vl = Math.hypot(vx, vy, vz) || 1;
         vx /= vl; vy /= vl; vz /= vl;
         const p = [x + d[0] * rx * 0.78, yc + d[1] * ry * 0.78, z + d[2] * rz * 0.78];
-        const half = Math.min(rx, rz) * (0.5 + rand(130 + i) * 0.16);
+        const half = Math.min(rx, rz) * (0.5 + rand(130 + i) * 0.16) * grow;
         // 法线：往外偏上，受光像一整个球
         const nl = Math.hypot(d[0], d[1] + 0.5, d[2]) || 1;
         const c = shade(mix(col, top, (yy + 0.4) / 1.35), 0.9 + rand(150 + i) * 0.2);
@@ -173,9 +193,11 @@ function underColor(kind: number): RGB {
 
 /**
  * 把一个块的数据构建成渲染网格（地形 + 树/石头/灌木/桥），按“每帧时间预算”调用。
- * kindGlobal：按全局格子坐标查类型，用来看相邻块边缘的格子（草地过渡、桥栏杆在块之间要连续）
+ * kindGlobal：按全局格子坐标查类型，用来看相邻块边缘的格子（草地过渡、桥栏杆在块之间要连续）。
+ * far = true 构建远处用的简化版（省显存）：地形和物件的位置、轮廓不变，只去掉远处看不清的小东西——
+ * 不画碎石、花和果子，叶簇面片减半，松枝切面减少
  */
-export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: number) => number): ChunkMesh[] {
+export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: number) => number, far = false): ChunkMesh[] {
     const mb = new MeshBuilder();
     const grass = new MeshBuilder(true);
     const sand = new MeshBuilder(true);
@@ -189,7 +211,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
     const bark = new MeshBuilder(true, BARK_TILE);
     const leafcard = new MeshBuilder(true);
     const pine = new MeshBuilder(true);
-    const veg: Veg = { leaf: foliage, card: leafcard, pine, bark, base: mb };
+    const veg: Veg = { leaf: foliage, card: leafcard, pine, bark, base: mb, far };
     const gx0 = data.cx * CHUNK_CELLS, gz0 = data.cz * CHUNK_CELLS;
     granite.uvOriginX = strata.uvOriginX = foliage.uvOriginX = bark.uvOriginX = gx0 * CELL;
     granite.uvOriginZ = strata.uvOriginZ = foliage.uvOriginZ = bark.uvOriginZ = gz0 * CELL;
@@ -239,13 +261,17 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
         for (let x = -1; x <= V; x++)
             R[(z + 1) * RW + x + 1] = terrainHeight((gx0 + x) * CELL, (gz0 + z) * CELL);
     // TA：山路砂石层的顶点 alpha，按顶点到山路中心线的距离算（连续的，所以路边是平滑的曲线而不是格子边）
-    const TA = new Float32Array(V * V);
+    // 和 R 一样多算一圈（下标 (z+1)*RW+x+1），用来判断外面一圈格子是不是挨着山路
+    const TA = new Float32Array(RW * RW);
     if (chunkHasMountainTrail(data.cx, data.cz)) {
-        for (let z = 0; z <= N; z++)
-            for (let x = 0; x <= N; x++)
-                TA[z * V + x] = trailAlpha(mountainTrailDistance((gx0 + x) * CELL, (gz0 + z) * CELL));
+        for (let z = -1; z <= V; z++)
+            for (let x = -1; x <= V; x++)
+                TA[(z + 1) * RW + x + 1] = trailAlpha(mountainTrailDistance((gx0 + x) * CELL, (gz0 + z) * CELL));
     }
     const H = new Float32Array(V * V);
+    // GX/GZ：原始地形的坡度（高度对 x、z 的偏导），用来算平滑法线
+    const GX = new Float32Array(V * V);
+    const GZ = new Float32Array(V * V);
     const MG = new Float32Array(V * V);
     const AG = new Float32Array(V * V);
     const AS = new Float32Array(V * V);
@@ -253,7 +279,10 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
         for (let x = 0; x <= N; x++) {
             const ri = (z + 1) * RW + x + 1;
             let h = R[ri];
-            const slope = Math.hypot(R[ri + 1] - R[ri - 1], R[ri + RW] - R[ri - RW]) / (2 * CELL);
+            const ddx = (R[ri + 1] - R[ri - 1]) / (2 * CELL), ddz = (R[ri + RW] - R[ri - RW]) / (2 * CELL);
+            const slope = Math.hypot(ddx, ddz);
+            GX[z * V + x] = ddx;
+            GZ[z * V + x] = ddz;
             const mg = mountainGrass(h, slope);
             let road = false, g = 0, s = 0, w = 0;
             for (let j = -1; j <= 0; j++) {
@@ -285,6 +314,172 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
             AS[z * V + x] = 0.5 + 0.5 * (s / 4);
         }
     }
+
+    // VG：草地层的顶点颜色 = 周围 4 格草色的平均（山体格用山上的草色，石头格偏暗，各带逐格的深浅变化）。
+    // 颜色在格子内渐变，看不出一格一格的色块；平地和山体的草地层在共享边上用同一份颜色，交界处没有色差
+    const VGR = new Float32Array(V * V), VGG = new Float32Array(V * V), VGB = new Float32Array(V * V);
+    for (let z = 0; z <= N; z++) {
+        for (let x = 0; x <= N; x++) {
+            let r = 0, g = 0, b = 0;
+            for (let j = -1; j <= 0; j++) {
+                for (let i = -1; i <= 0; i++) {
+                    const k = kindAt(x + i, z + j), jt = hash2(gx0 + x + i, gz0 + z + j, SEED + 3);
+                    const c = k === Cell.Mountain ? MTN_GRASS : COLORS[Cell.Grass];
+                    const f = k === Cell.Mountain ? 0.94 + jt * 0.12 : k === Cell.Rock ? 0.88 + jt * 0.06 : 0.97 + jt * 0.06;
+                    r += c[0] * f; g += c[1] * f; b += c[2] * f;
+                }
+            }
+            const s = TEX_GAIN / 4, vi = z * V + x;
+            VGR[vi] = Math.min(1, r * s); VGG[vi] = Math.min(1, g * s); VGB[vi] = Math.min(1, b * s);
+        }
+    }
+    /**
+     * 平地的贴图层（草地、沙地）的一个格子：4 个顶点 + 2 个三角形，抬高 lift。
+     * 法线按顶点算（地形坡度 GX/GZ），相邻格子在共享的顶点上法线相同，坡上的光照连续过渡，
+     * 看不出一块块的三角面（平面着色时每个三角形一个明暗，山脚的斜坡上特别显眼）。
+     * col 不传时用草地的顶点颜色 VG。对角线和 quad 一样（00-11），不会被下面垫的底色层戳穿
+     */
+    const groundQuad = (mesh: MeshBuilder, lx: number, lz: number, lift: number, tile: number, al: number[], col?: RGB) => {
+        mesh.reserve(4);
+        const vert = (x: number, z: number, a: number) => {
+            const k = z * V + x, sx = GX[k], sz = GZ[k], inv = 1 / Math.hypot(sx, 1, sz);
+            return mesh.addVertex((gx0 + x) * CELL, H[k] + lift, (gz0 + z) * CELL, -sx * inv, inv, -sz * inv,
+                col ? col[0] : VGR[k], col ? col[1] : VGG[k], col ? col[2] : VGB[k], a, x * CELL / tile, z * CELL / tile);
+        };
+        const a = vert(lx, lz, al[0]), b = vert(lx + 1, lz, al[1]), c = vert(lx + 1, lz + 1, al[2]), d = vert(lx, lz + 1, al[3]);
+        mesh.addTri(a, b, c);
+        mesh.addTri(a, c, d);
+    };
+
+    // ---- 山体细分网格 ----
+    // 山体格子每边细分成 MTN_SUB 段，顶点带平滑法线和逐顶点颜色，并叠加岩石起伏 mountainDetail，
+    // 看不出一格一格的大三角面。
+    // DW：起伏的权重（格子顶点）。只有周围 4 格都是山体、且都不挨着山路的顶点才起伏：
+    // - 山体与草地/道路相接的边上权重为 0，细分出来的中间顶点仍在原来的直线上，和旁边不细分的格子没有缝；
+    // - 山路格子的四个角权重都是 0，路面高度仍等于 terrainHeight（角色站立的高度）。
+    const FN = N * MTN_SUB, FV = FN + 1;
+    let hasMtn = false;
+    for (let z = 0; z < N && !hasMtn; z++)
+        for (let x = 0; x < N; x++) if (kindAt(x, z) === Cell.Mountain) { hasMtn = true; break; }
+    const FH = new Float32Array(hasMtn ? FV * FV : 0);       // 高度
+    const FNR = new Float32Array(hasMtn ? FV * FV * 3 : 0);  // 法线
+    const FRC = new Float32Array(hasMtn ? FV * FV * 3 : 0);  // 岩石层颜色
+    const FGC = new Float32Array(hasMtn ? FV * FV * 3 : 0);  // 草地层颜色
+    const FAG = new Float32Array(hasMtn ? FV * FV : 0);      // 草地层 alpha
+    const FTA = new Float32Array(hasMtn ? FV * FV : 0);      // 山路砂石层 alpha
+    if (hasMtn) {
+        const roughCell = (lx: number, lz: number) => {
+            if (kindAt(lx, lz) !== Cell.Mountain || isTrail(lx, lz)) return false;
+            const t = (lz + 1) * RW + lx + 1;
+            return TA[t] === 0 && TA[t + 1] === 0 && TA[t + RW] === 0 && TA[t + RW + 1] === 0;
+        };
+        const DW = new Float32Array(V * V);
+        for (let z = 0; z <= N; z++)
+            for (let x = 0; x <= N; x++)
+                DW[z * V + x] = roughCell(x - 1, z - 1) && roughCell(x, z - 1) && roughCell(x - 1, z) && roughCell(x, z) ? 1 : 0;
+        // 起伏噪声多算一圈，块边缘的顶点也能用中心差分求坡度（相邻块的法线一致）
+        const NW = FN + 3;
+        const DN = new Float32Array(NW * NW);
+        const ox = gx0 * CELL, oz = gz0 * CELL;
+        for (let j = -1; j <= FN + 1; j++)
+            for (let i = -1; i <= FN + 1; i++)
+                DN[(j + 1) * NW + i + 1] = mountainDetail(ox + i * MTN_STEP, oz + j * MTN_STEP);
+        for (let j = 0; j <= FN; j++) {
+            const cz0 = Math.min(Math.floor(j / MTN_SUB), N - 1), tz = j / MTN_SUB - cz0;
+            for (let i = 0; i <= FN; i++) {
+                const cx0 = Math.min(Math.floor(i / MTN_SUB), N - 1), tx = i / MTN_SUB - cx0;
+                const c00 = cz0 * V + cx0, c10 = c00 + 1, c01 = c00 + V, c11 = c01 + 1;
+                const w00 = (1 - tx) * (1 - tz), w10 = tx * (1 - tz), w01 = (1 - tx) * tz, w11 = tx * tz;
+                const lerp = (A: Float32Array) => A[c00] * w00 + A[c10] * w10 + A[c01] * w01 + A[c11] * w11;
+                const di = (j + 1) * NW + i + 1, d = DN[di];
+                const mg = lerp(MG);
+                // 裸露的岩石起伏大，长草的缓坡起伏小
+                const amp = lerp(DW) * (0.25 + 0.95 * (1 - mg));
+                const h = lerp(H) + amp * d;
+                const sx = lerp(GX) + amp * (DN[di + 1] - DN[di - 1]) / (2 * MTN_STEP);
+                const sz = lerp(GZ) + amp * (DN[di + NW] - DN[di - NW]) / (2 * MTN_STEP);
+                const inv = 1 / Math.hypot(sx, 1, sz);
+                const k = j * FV + i, k3 = k * 3;
+                FH[k] = h;
+                FNR[k3] = -sx * inv; FNR[k3 + 1] = inv; FNR[k3 + 2] = -sz * inv;
+                FAG[k] = lerp(AG);
+                const t00 = (cz0 + 1) * RW + cx0 + 1;
+                FTA[k] = TA[t00] * w00 + TA[t00 + 1] * w10 + TA[t00 + RW] * w01 + TA[t00 + RW + 1] * w11;
+                // 颜色逐顶点算：雪线、岩石深浅按连续的噪声变化；凹处暗、凸处亮，岩面更有体积感
+                const wx = ox + i * MTN_STEP, wz = oz + j * MTN_STEP;
+                const jit = valueNoise(wx / 3, wz / 3, SEED + 3);
+                const lit = 0.84 + 0.32 * (d * 0.5 + 0.5);
+                const rc = shade(mountainRockColor(h, Math.hypot(sx, sz) * 1.2, jit), lit * TEX_GAIN);
+                FRC[k3] = rc[0]; FRC[k3 + 1] = rc[1]; FRC[k3 + 2] = rc[2];
+                // 草地层颜色用格子顶点颜色 VG 的插值：和旁边平地的草地层在共享边上完全一样
+                FGC[k3] = lerp(VGR); FGC[k3 + 1] = lerp(VGG); FGC[k3 + 2] = lerp(VGB);
+            }
+        }
+    }
+    /** 细分网格上 (u,v)（单位：细分格）处的山体表面高度 */
+    const fineY = (u: number, v: number) => {
+        const i0 = Math.min(Math.floor(u), FN - 1), j0 = Math.min(Math.floor(v), FN - 1);
+        const tx = u - i0, tz = v - j0, k = j0 * FV + i0;
+        return (FH[k] * (1 - tx) + FH[k + 1] * tx) * (1 - tz) + (FH[k + FV] * (1 - tx) + FH[k + FV + 1] * tx) * tz;
+    };
+    /**
+     * 细分网格顶点 (i,j) 在 mesh 里的下标，没有就新加一个。相邻的面共用顶点（每个四边形平均只多 1 个顶点）。
+     * layer：0 岩石层、1 草地层、2 山路砂石层。三层用同一份高度（只差抬高量），切分的对角线也一样，
+     * 上面的层不会被下面的层戳穿。
+     * mode 只对岩石层有用，是 UV 的投影面（见 rockUVMode）；同一个顶点在不同投影面下 UV 不同，各存一份
+     */
+    const vcache = new Map<MeshBuilder, { ids: Int32Array; epoch: number }>();
+    const mtnIndex = (mesh: MeshBuilder, i: number, j: number, layer: number, mode: number): number => {
+        let c = vcache.get(mesh);
+        if (!c) {
+            c = { ids: new Int32Array(FV * FV * 3).fill(-1), epoch: mesh.epoch };
+            vcache.set(mesh, c);
+        } else if (c.epoch !== mesh.epoch) {
+            // 顶点满了切分出了新的 Mesh，之前的下标作废
+            c.ids.fill(-1);
+            c.epoch = mesh.epoch;
+        }
+        const k = j * FV + i, k3 = k * 3, key = k3 + mode;
+        if (c.ids[key] >= 0) return c.ids[key];
+        const lx = i * MTN_STEP, lz = j * MTN_STEP;
+        const px = gx0 * CELL + lx, pz = gz0 * CELL + lz;
+        const h = FH[k], nx = FNR[k3], ny = FNR[k3 + 1], nz = FNR[k3 + 2];
+        let id: number;
+        if (layer === 1) {
+            id = mesh.addVertex(px, h + GRASS_LIFT, pz, nx, ny, nz, FGC[k3], FGC[k3 + 1], FGC[k3 + 2], FAG[k],
+                lx / GRASS_TILE, lz / GRASS_TILE);
+        } else if (layer === 2) {
+            id = mesh.addVertex(px, h + TRAIL_LIFT, pz, nx, ny, nz, GRAVEL_COL[0], GRAVEL_COL[1], GRAVEL_COL[2], FTA[k],
+                lx / GRAVEL_TILE, lz / GRAVEL_TILE);
+        } else {
+            // 缓坡投影 (x,z)；朝 ±x 的陡坡投影 (z,y)；朝 ±z 的陡坡投影 (x,y)
+            const u = mode === 1 ? lz : lx, v = mode === 0 ? lz : h;
+            id = mesh.addVertex(px, h, pz, nx, ny, nz, FRC[k3], FRC[k3 + 1], FRC[k3 + 2], 1, u / ROCK_TILE, v / ROCK_TILE);
+        }
+        c.ids[key] = id;
+        return id;
+    };
+    /** 画一个山体格子的某一层（细分成 MTN_SUB × MTN_SUB 个平滑四边形） */
+    const mountainCell = (mesh: MeshBuilder, lx: number, lz: number, layer: number) => {
+        for (let sj = 0; sj < MTN_SUB; sj++) {
+            for (let si = 0; si < MTN_SUB; si++) {
+                const i = lx * MTN_SUB + si, j = lz * MTN_SUB + sj;
+                const k = j * FV + i;
+                const ha = FH[k], hb = FH[k + 1], hc = FH[k + FV + 1], hd = FH[k + FV];
+                const mode = layer === 0 ? rockUVMode(MTN_STEP, ha, hb, hc, hd) : 0;
+                // 四个顶点必须和之前共用的顶点在同一个 Mesh 里
+                mesh.reserve(4);
+                const a = mtnIndex(mesh, i, j, layer, mode), b = mtnIndex(mesh, i + 1, j, layer, mode);
+                const c = mtnIndex(mesh, i + 1, j + 1, layer, mode), d = mtnIndex(mesh, i, j + 1, layer, mode);
+                // 沿高度差较小的对角线切开，山脊、山沟的走向不会被三角形切成锯齿
+                if (Math.abs(ha - hc) <= Math.abs(hb - hd)) {
+                    mesh.addTri(a, b, c); mesh.addTri(a, c, d);
+                } else {
+                    mesh.addTri(a, b, d); mesh.addTri(b, c, d);
+                }
+            }
+        }
+    };
 
     for (let lz = 0; lz < N; lz++) {
         for (let lx = 0; lx < N; lx++) {
@@ -320,8 +515,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
             // base 层：非贴图格子总是画；贴图格子只在边缘（有裁剪）时画，做底色
             if (kind === Cell.Mountain) {
                 // 岩石层；四个顶点都被草完全盖住的格子不用画
-                if (gMin < 1) rock.quad([x0, h00, z0], [x1, h10, z0], [x1, h11, z1], [x0, h01, z1], col, ref,
-                    rockUV(lx, lz, h00, h10, h11, h01));
+                if (gMin < 1) mountainCell(rock, lx, lz, 0);
             } else if (kind === Cell.Road) {
                 gravelQuad(gravel, lx, lz, x0, z0, h00, h10, h11, h01, ref);
             } else if (!textured) {
@@ -341,20 +535,19 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                 }
             }
             // 草地层
-            if (grassCell || gMax > 0.5) {
-                const gcol = grassCell ? col
-                    : shade(kind === Cell.Mountain ? MTN_GRASS : COLORS[Cell.Grass], (0.97 + jitter * 0.06) * TEX_GAIN);
+            if (kind === Cell.Mountain) {
+                if (gMax > 0.5) mountainCell(grass, lx, lz, 1);
+            } else if (grassCell || gMax > 0.5) {
                 // UV 用块内坐标（块边长是 GRASS_TILE 的整数倍，块之间无缝），避免远处 UV 过大损失精度
-                const u0 = (lx * CELL) / GRASS_TILE, u1 = u0 + CELL / GRASS_TILE;
-                const v0 = (lz * CELL) / GRASS_TILE, v1 = v0 + CELL / GRASS_TILE;
-                const L = GRASS_LIFT;
-                grass.quad([x0, h00 + L, z0], [x1, h10 + L, z0], [x1, h11 + L, z1], [x0, h01 + L, z1], gcol, ref,
-                    [u0, v0, u1, v0, u1, v1, u0, v1], gal);
+                groundQuad(grass, lx, lz, GRASS_LIFT, GRASS_TILE, gal);
             }
             // 山路砂石层：盖在草地层上面，边缘由顶点 alpha × 贴图 alpha 裁出参差的路边
-            const tal = [TA[i00], TA[i10], TA[i11], TA[i01]];
+            const t00 = (lz + 1) * RW + lx + 1;
+            const tal = [TA[t00], TA[t00 + 1], TA[t00 + RW + 1], TA[t00 + RW]];
             const tMax = Math.max(tal[0], tal[1], tal[2], tal[3]);
-            if (tMax > TRAIL_ALPHA_MIN) {
+            if (tMax > TRAIL_ALPHA_MIN && kind === Cell.Mountain) {
+                mountainCell(trail, lx, lz, 2);
+            } else if (tMax > TRAIL_ALPHA_MIN) {
                 const u0 = lx * CELL / GRAVEL_TILE, u1 = u0 + CELL / GRAVEL_TILE;
                 const v0 = lz * CELL / GRAVEL_TILE, v1 = v0 + CELL / GRAVEL_TILE;
                 const L = TRAIL_LIFT;
@@ -364,11 +557,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
             // 沙地层
             if (sandCell || sMax > 0.5) {
                 const scol = sandCell ? col : shade(COLORS[Cell.Sand], (0.97 + jitter * 0.06) * TEX_GAIN);
-                const su0 = (lx * CELL) / SAND_TILE, su1 = su0 + CELL / SAND_TILE;
-                const sv0 = (lz * CELL) / SAND_TILE, sv1 = sv0 + CELL / SAND_TILE;
-                const L = SAND_LIFT;
-                sand.quad([x0, h00 + L, z0], [x1, h10 + L, z0], [x1, h11 + L, z1], [x0, h01 + L, z1], scol, ref,
-                    [su0, sv0, su1, sv0, su1, sv1, su0, sv1], sal);
+                groundQuad(sand, lx, lz, SAND_LIFT, SAND_TILE, sal, scol);
             }
 
             const baseY = Math.max(Math.min(h00, h10, h01, h11), WALK_MIN_Y - 0.3);
@@ -382,10 +571,10 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                     // 山路和路边不放（tMax > 0 表示格子挨着山路）
                     if (hAvg > SNOW_LINE - 3 || tMax > 0 || isTrail(lx, lz)) break;
                     const cg = (MG[i00] + MG[i10] + MG[i01] + MG[i11]) / 4;
-                    // 偏离格子中心，避免排成网格；高度取该点的双线性插值，往下埋一点防止在坡上悬空
+                    // 偏离格子中心，避免排成网格；高度取细分网格上该点的高度，往下埋一点防止在坡上悬空
                     const fx = 0.25 + 0.5 * hash2(gx, gz, SEED + 101), fz = 0.25 + 0.5 * hash2(gx, gz, SEED + 102);
                     const px = x0 + fx * CELL, pz = z0 + fz * CELL;
-                    const py = (h00 * (1 - fx) + h10 * fx) * (1 - fz) + (h01 * (1 - fx) + h11 * fx) * fz;
+                    const py = fineY((lx + fx) * MTN_SUB, (lz + fz) * MTN_SUB);
                     if (cg > 0.45 && slope < 1.3 && r < 0.12 + cg * 0.33) {
                         // 越高越偏黄，山顶附近有整棵变红的
                         const autumn = smoothstep(SNOW_LINE - 16, SNOW_LINE - 4, py);
@@ -413,12 +602,12 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                     const inField = rockN >= 3;
                     const strataZone = stoneZone(cxw, czw);
                     if (inField && hs(1) < 0.3) {
-                        pebbles(granite, strata, gx, gz, x0, z0, baseY, bigStones, strataZone, 2);
+                        if (!far) pebbles(granite, strata, gx, gz, x0, z0, baseY, bigStones, strataZone, 2);
                         break;
                     }
                     const scale = inField ? 0.5 + hs(0) * 0.55 : 0.85 + hs(0) * 0.2;
                     stoneCell(granite, strata, gx, gz, cxw, baseY, czw, jitter, scale, stoneHeightScale(cxw, czw), strataZone);
-                    pebbles(granite, strata, gx, gz, x0, z0, baseY, bigStones, strataZone, 0);
+                    if (!far) pebbles(granite, strata, gx, gz, x0, z0, baseY, bigStones, strataZone, 0);
                     break;
                 }
                 case Cell.Bush:
@@ -495,14 +684,15 @@ function bushCell(v: Veg, gx: number, gz: number, x: number, y: number, z: numbe
         return pts;
     };
 
-    /** 在叶簇表面散落小方块（花、果子） */
+    /** 在叶簇表面散落小凸起（花、果子）；远处的块不画 */
     const dots = (pts: number[][], cols: RGB[], per: number, size: number) => {
+        if (v.far) return;
         let k = 0;
         for (const [px, py, pz, r] of pts) {
             for (let i = 0; i < per; i++, k++) {
                 const a = h(60 + k) * Math.PI * 2, d = r * (0.2 + h(80 + k) * 0.5);
                 const c = cols[Math.floor(h(100 + k) * cols.length)];
-                v.base.box(px + Math.cos(a) * d, py - d * 0.35, pz + Math.sin(a) * d, size, size, size, shade(c, 0.85), c);
+                v.base.stud(px + Math.cos(a) * d, py - d * 0.35, pz + Math.sin(a) * d, size, shade(c, 0.85), c);
             }
         }
     };
@@ -551,20 +741,56 @@ function bushCell(v: Veg, gx: number, gz: number, x: number, y: number, z: numbe
     }
 }
 
+/** 棕榈离水最远多少米 */
+const PALM_WATER_DIST = 21;
+/** 地形噪声高于这个值的地方离水一定很远，不用再采样（省时间） */
+const PALM_NOISE_MAX = 0.47;
+
+/**
+ * 点 (x,z) 处的树是棕榈的概率（0 = 不会是棕榈）。
+ * 在周围 8 个方向 × 3 圈（7 / 14 / 21 米）采样地形：
+ * - 一个水面采样点都没有 => 0，不在水附近不长棕榈（只看地形噪声不行：地势平缓的地方噪声值低，但离水可以很远）；
+ * - 有水：沙地采样点越多（沙滩越大）概率越高，大沙滩边上成片（约 85%），只有一条窄沙边的水边零星几棵（约 15%）
+ */
+function palmChance(x: number, z: number): number {
+    if (terrainNoise(x, z) > PALM_NOISE_MAX) return 0;
+    let water = 0, sand = 0;
+    for (let ring = 1; ring <= 3; ring++) {
+        const d = ring * PALM_WATER_DIST / 3;
+        for (let k = 0; k < 8; k++) {
+            const a = (k + ring * 0.5) * Math.PI / 4;
+            const n = terrainNoise(x + Math.cos(a) * d, z + Math.sin(a) * d);
+            if (n < WATER_NOISE) water++;
+            else if (n < SAND_NOISE) sand++;
+        }
+    }
+    if (water === 0) return 0;
+    return 0.15 + 0.7 * smoothstep(0.1, 0.35, sand / 24);
+}
+
 /**
  * 一棵树，按格子哈希从四种造型里选一种：
  * 0 松树（树干 + 五层松枝裙摆，下沿由松枝贴图裁成参差的枝梢）；1 阔叶树（主干分出三根枝，四团叶簇）；
  * 2 红叶树（浅色树干分出三根枝，五团红叶）；3 棕榈（两节弯曲的树干 + 七片弧形长叶）。
- * 叶子画在 foliage 层（树叶贴图），树干树枝画在 bark 层（树皮贴图）。
- * 高度 4~6 米。s 是整体缩放，leaf 是基础叶色，mountain 为 true 时不出棕榈、红叶树用传入的秋色
+ * 叶团画在 foliage 层（树叶贴图），树干树枝画在 bark 层（树皮贴图），棕榈的长叶和果子画在 base 层（纯顶点色）。
+ * 高度 4~6 米。s 是整体缩放，leaf 是基础叶色，mountain 为 true 时不出棕榈、红叶树用传入的秋色。
+ * 棕榈只出现在水边，松树按低频噪声成片分布、大小不一
  */
 function treeCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, s: number, leaf: RGB, mountain = false) {
     const rnd = (k: number) => (i: number) => hash2(gx * 73 + i, gz * 59 + k, SEED + 4300);
     const h = (k: number) => hash2(gx, gz, SEED + 4400 + k);
     const rot = h(1) * Math.PI * 2;
-    // 平地：松树 35%、阔叶树 35%、红叶树 18%、棕榈 12%；山上没有棕榈
-    const p = h(0);
-    const variant = mountain ? (p < 0.55 ? 0 : p < 0.8 ? 1 : 2) : (p < 0.35 ? 0 : p < 0.7 ? 1 : p < 0.88 ? 2 : 3);
+    // 棕榈只长在水边，大沙滩旁边成片，见 palmChance
+    const palmP = mountain ? 0 : palmChance(x, z);
+    // 松树成片：低频噪声划出松林，松林里绝大多数是松树，松林外只有零星几棵；山上松树本来就多
+    const stand = smoothstep(0.45, 0.6, fbm(x / 45, z / 45, 2, SEED + 4700));
+    const pineP = mountain ? 0.3 + 0.62 * stand : 0.05 + 0.87 * stand;
+    let variant: number;
+    if (h(0) < palmP) variant = 3;
+    else if (h(6) < pineP) variant = 0;
+    else variant = h(7) < 0.66 ? 1 : 2;
+    // 松林里大树小树混在一起：松树的大小差别拉大（约 0.55~1.25 倍）
+    if (variant === 0) s *= 0.55 + h(5) * 0.7;
     // 叶子和树干乘贴图，颜色要补偿贴图的平均亮度
     const T = (c: RGB, f = 1) => shade(c, f * TEX_GAIN);
     const trunk = T(TRUNK, 0.9 + h(2) * 0.2);
@@ -589,7 +815,7 @@ function treeCell(v: Veg, gx: number, gz: number, x: number, y: number, z: numbe
             const yBot = y + (0.75 + k * 0.85) * s;
             const yTop = yBot + (1.5 - t * 0.4) * s;
             v.pine.skirt(x, yTop, z, k === TIERS - 1 ? 0 : rBot * 0.2, yBot, rBot, T(leaf, 0.85 + t * 0.35),
-                8, rot + k * 0.9, k < 2 ? 2 : 1);
+                v.far ? 5 : 8, rot + k * 0.9, k < 2 ? 2 : 1);
         }
         return;
     }
@@ -627,14 +853,19 @@ function treeCell(v: Veg, gx: number, gz: number, x: number, y: number, z: numbe
         clump([x + Math.cos(a) * 0.9 * s, top + 1.6 * s, z + Math.sin(a) * 0.9 * s], 0.9, 0.7, col, light, 4);
         return;
     }
-    // 棕榈：两节往一边弯的细树干，顶上七片弧形长叶，中间一小团深色的果子
+    // 棕榈：两节往一边弯的细树干，顶上七片弧形长叶，中间一小团深色的果子。
+    // 成片的棕榈要错落有致：整体大小（约 0.6~1.3 倍）、树干高矮（0.75~1.3 倍）、弯的程度（0.4~1.8 倍）各自随机，
+    // 有高有矮、有直有斜，树冠不会排在同一个高度上
+    s *= 0.6 + h(5) * 0.7;
+    const tall = 0.75 + h(8) * 0.55, lean = 0.4 + h(9) * 1.4;
     const bark = T(TRUNK, 1.2);
     const a0 = rot;
-    const mx = x + Math.cos(a0) * 0.25 * s, mz = z + Math.sin(a0) * 0.25 * s, my = y + 2.2 * s;
-    const tx = x + Math.cos(a0) * 0.8 * s, tz = z + Math.sin(a0) * 0.8 * s, ty = y + 4.3 * s;
+    const mx = x + Math.cos(a0) * 0.25 * lean * s, mz = z + Math.sin(a0) * 0.25 * lean * s, my = y + 2.2 * tall * s;
+    const tx = x + Math.cos(a0) * 0.8 * lean * s, tz = z + Math.sin(a0) * 0.8 * lean * s, ty = y + 4.3 * tall * s;
     v.bark.prism(x, y, z, 0.2 * s, mx, my, mz, 0.15 * s, bark, 5, rot);
     v.bark.prism(mx, my, mz, 0.15 * s, tx, ty, tz, 0.11 * s, bark, 5, rot);
-    v.leaf.blob(tx, ty - 0.1 * s, tz, 0.3 * s, 0.25 * s, 0.3 * s, T(TRUNK, 0.8), T(TRUNK), rnd(9), 4);
+    // 果子和长叶画在纯顶点色的 base 层：树叶贴图是一片片小叶子，投影到一整片长叶上会变成斑点
+    v.base.blob(tx, ty - 0.1 * s, tz, 0.3 * s, 0.25 * s, 0.3 * s, shade(TRUNK, 0.8), TRUNK, rnd(9), 4);
     // 七片长叶：每片是一整条先上扬再下垂的弧形叶片；一高一低交替，树冠上下有层次
     for (let k = 0; k < 7; k++) {
         const a = rot + (k / 7) * Math.PI * 2 + (h(50 + k) - 0.5) * 0.4;
@@ -642,8 +873,8 @@ function treeCell(v: Veg, gx: number, gz: number, x: number, y: number, z: numbe
         const len = (high ? 1.5 : 2.0) * (0.9 + h(20 + k) * 0.25) * s;
         const rise = (high ? 0.75 : 0.4) * s;
         const droop = (high ? 0.1 : 0.7 + h(30 + k) * 0.5) * s;
-        v.leaf.frond(tx, ty, tz, Math.cos(a), Math.sin(a), len, rise, droop, 0.34 * s,
-            T(LEAF_LIGHT, (high ? 0.95 : 0.8) + h(40 + k) * 0.2));
+        v.base.frond(tx, ty, tz, Math.cos(a), Math.sin(a), len, rise, droop, 0.34 * s,
+            shade(LEAF_LIGHT, (high ? 0.95 : 0.8) + h(40 + k) * 0.2));
     }
 }
 
@@ -812,9 +1043,9 @@ function drawBigStone(granite: MeshBuilder, strata: MeshBuilder, s: BigStone) {
     const rx = s.r * (0.85 + hash2(s.seed, 2, SEED + 4830) * 0.3);
     const rz = s.r * (0.85 + hash2(s.seed, 3, SEED + 4830) * 0.3);
     const bulge = s.strata ? 0.8 + hash2(s.seed, 4, SEED + 4830) * 0.25 : 1.02 + hash2(s.seed, 4, SEED + 4830) * 0.16;
-    // 14 个切面，大石头看起来圆，不会是一个大锥子
+    // 14 个切面，大石头看起来圆，不会是一个大锥子；平滑着色，看不出一块块的三角面
     mb.rock(s.x, terrainHeight(s.x, s.z) - 0.4, s.z, rx, rz, s.h, s.rot, col, rnd, bulge,
-        s.moss ? shade(MOSS, 0.9 + hash2(s.seed, 5, SEED + 4830) * 0.2) : undefined, 14);
+        s.moss ? shade(MOSS, 0.9 + hash2(s.seed, 5, SEED + 4830) * 0.2) : undefined, 14, true);
 }
 
 /** 格子角落的碎石：只在石头格子旁边出现，打破格子的轮廓 */
@@ -828,8 +1059,9 @@ function pebbles(granite: MeshBuilder, strata: MeshBuilder, gx: number, gz: numb
         const mb = h(30 + k) < strataZone ? strata : granite;
         const r = 0.16 + h(40 + k) * 0.22;
         const col = shade(mb === strata ? STRATA : GRANITE, 0.85 + h(50 + k) * 0.25);
+        // 碎石很小，4 个切面、两圈顶点就够（12 个三角形）
         mb.rock(px, y - 0.1, pz, r, r * (0.75 + h(60 + k) * 0.4), 0.22 + h(70 + k) * 0.28,
-            h(80 + k) * Math.PI * 2, col, i => hash2(gx * 17 + k, gz * 13 + i, SEED + 4960), 1.1);
+            h(80 + k) * Math.PI * 2, col, i => hash2(gx * 17 + k, gz * 13 + i, SEED + 4960), 1.1, undefined, 4);
     }
 }
 
@@ -846,18 +1078,16 @@ function gravelQuad(gravel: MeshBuilder, lx: number, lz: number, x0: number, z0:
 }
 
 /**
- * 山体格子的岩石 UV（顶点顺序 00-10-11-01）。按格子朝向选投影面：
- * 缓坡从上往下投影 (x,z)；陡坡投影到侧面 (水平, 高度)，悬崖上的纹理不会被拉长，岩层是横向的。
+ * 山体岩石面的 UV 投影面（顶点顺序 00-10-11-01，size 是边长，米）。按面的朝向选：
+ * 0 缓坡，从上往下投影 (x,z)；1 朝 ±x 的陡坡，投影到 (z, 高度)；2 朝 ±z 的陡坡，投影到 (x, 高度)。
+ * 陡坡投影到侧面，悬崖上的纹理不会被拉长，岩层是横向的。
  * 水平坐标用块内坐标（块边长是 ROCK_TILE 的整数倍，块之间无缝）
  */
-function rockUV(lx: number, lz: number, h00: number, h10: number, h11: number, h01: number): number[] {
-    const T = ROCK_TILE;
-    const x0 = lx * CELL / T, x1 = x0 + CELL / T, z0 = lz * CELL / T, z1 = z0 + CELL / T;
-    const dhx = Math.abs((h10 + h11) - (h00 + h01)) / (2 * CELL);
-    const dhz = Math.abs((h01 + h11) - (h00 + h10)) / (2 * CELL);
-    if (Math.max(dhx, dhz) < 0.8) return [x0, z0, x1, z0, x1, z1, x0, z1];
-    if (dhx > dhz) return [z0, h00 / T, z0, h10 / T, z1, h11 / T, z1, h01 / T];   // 朝 ±x 的坡：投影到 (z, y)
-    return [x0, h00 / T, x1, h10 / T, x1, h11 / T, x0, h01 / T];                    // 朝 ±z 的坡：投影到 (x, y)
+function rockUVMode(size: number, h00: number, h10: number, h11: number, h01: number): number {
+    const dhx = Math.abs((h10 + h11) - (h00 + h01)) / (2 * size);
+    const dhz = Math.abs((h01 + h11) - (h00 + h10)) / (2 * size);
+    if (Math.max(dhx, dhz) < 0.8) return 0;
+    return dhx > dhz ? 1 : 2;
 }
 
 /** 桥面顶部高度 = 可走高度，角色正好站在桥面上 */

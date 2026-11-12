@@ -21,7 +21,9 @@ export const WATER_Y = -2.0;
 export const WALK_MIN_Y = WATER_Y + 0.15;
 
 /** 水体判定阈值（与 generateChunk 一致） */
-const WATER_NOISE = 0.36;
+export const WATER_NOISE = 0.36;
+/** 沙地判定阈值：地形噪声在 [WATER_NOISE, SAND_NOISE) 之间是沙地（与 generateChunk 一致） */
+export const SAND_NOISE = 0.395;
 /** 小水坑被抬到这个噪声值（沙地，略高于水面） */
 const POND_FLOOR = WATER_NOISE + 0.012;
 
@@ -51,14 +53,20 @@ export const MOUNTAIN_CELL_MIN = 2.2;
 /** 道路中心保留的山体比例（山口略微隆起，而不是完全平的峡谷） */
 const ROAD_KEEP = 0.04;
 
-/** 山体高度（米），没有山的地方为 0。n 为 terrainNoise 的值 */
-export function mountainHeight(wx: number, wz: number, n: number): number {
+/** 不考虑道路山谷的山体高度（米），没有山的地方为 0。只用噪声，不会触发道路生成 */
+export function mountainBase(wx: number, wz: number, n: number): number {
     // 山区分布（低频）；低洼处（湖泊、沙滩）不长山，水体判定保持不变
     const mask = smoothstep(0.52, 0.64, fbm(wx / 240, wz / 240, 3, SEED + 900)) * smoothstep(0.40, 0.50, n);
     if (mask <= 0) return 0;
     const ridge = ridgedFbm(wx / 110, wz / 110, 5, SEED + 700);
+    return mask * (0.1 + ridge * ridge * 1.1) * MOUNTAIN_HEIGHT;
+}
+
+/** 山体高度（米），没有山的地方为 0。n 为 terrainNoise 的值 */
+export function mountainHeight(wx: number, wz: number, n: number): number {
+    const b = mountainBase(wx, wz, n);
     // 道路切开山体形成山谷
-    return mask * (0.1 + ridge * ridge * 1.1) * MOUNTAIN_HEIGHT * roadValley(wx, wz);
+    return b <= 0 ? 0 : b * roadValley(wx, wz);
 }
 
 /** 不含山路修整的地形高度（米） */
@@ -87,7 +95,7 @@ export function groundY(wx: number, wz: number): number {
 
 /** 大区边长（块数 / 米）。大区 (rx,rz) 覆盖 [(rx-0.5)R, (rx+0.5)R) */
 const REGION_CHUNKS = 8;
-const REGION = REGION_CHUNKS * CHUNK_SIZE;
+export const REGION = REGION_CHUNKS * CHUNK_SIZE;
 
 interface RoadStyle {
     /** 路面半宽（米）：离中心线这么远以内的格子是路 */
@@ -662,7 +670,7 @@ export function mountainTrailDistance(wx: number, wz: number): number {
 export function trailGroundKind(wx: number, wz: number): number {
     const n = terrainNoise(wx, wz);
     if (mountainHeight(wx, wz, n) > MOUNTAIN_CELL_MIN) return Cell.Mountain;
-    return n < 0.395 ? Cell.Sand : Cell.Grass;
+    return n < SAND_NOISE ? Cell.Sand : Cell.Grass;
 }
 
 /** 是否在主干道/小路的路面上（不含山路） */
@@ -714,7 +722,7 @@ export function generateChunk(cx: number, cz: number): ChunkData {
             let kind: number = Cell.Grass;
             if (mountainHeight(wx, wz, n) > MOUNTAIN_CELL_MIN) kind = Cell.Mountain;
             else if (n < WATER_NOISE) kind = Cell.Water;
-            else if (n < 0.395) kind = Cell.Sand;
+            else if (n < SAND_NOISE) kind = Cell.Sand;
             else if (n > 0.66) kind = Cell.Rock;
             else {
                 const forest = fbm(wx / 70, wz / 70, 3, SEED + 500);

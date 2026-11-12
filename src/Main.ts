@@ -1,4 +1,5 @@
 import { SpawnPoint } from "./editor/SpawnPoint";
+import { AreaBanner } from "./ui/AreaBanner";
 import { Minimap } from "./ui/Minimap";
 import { MonsterManager, Player } from "./world/Actors";
 import { ChunkManager } from "./world/ChunkManager";
@@ -16,7 +17,7 @@ const DRAW_PATHS = false;
 
 /**
  * 开放世界原型入口。
- * 操作：鼠标左键点击地面 → 主角自动寻路；点击树 → 走过去砍掉；按住 F 砍面前的树；WASD 直接移动；滚轮缩放；
+ * 操作：鼠标左键点击地面 → 主角自动寻路；点击小地图/大地图 → 寻路到地图上对应的位置；点击树 → 走过去砍掉；按住 F 砍面前的树；WASD 直接移动；滚轮缩放；
  *      G 键自动前往 1~2 公里外的随机地点（测试长距离分段寻路和流式加载）；H 键沿山路去最近的山顶（在山顶再按去下一座）；
  *      M 键切换小地图/大地图。
  * 刷怪点：在场景里任意位置放挂了 SpawnPoint 组件的节点，启动时自动收集。
@@ -35,6 +36,7 @@ export class Main extends Laya.Script {
     private hud: Laya.Text;
     private spawns = new SpawnRegistry();
     private minimap: Minimap;
+    private banner: AreaBanner;
 
     private camDist = 26;
     private ray = new Laya.Ray(new Laya.Vector3(), new Laya.Vector3());
@@ -78,6 +80,7 @@ export class Main extends Laya.Script {
         this.collectSpawnPoints(this.scene3D);
         this.monsters = new MonsterManager(this.scene3D, this.nav, this.paths, this.spawns);
         this.minimap = new Minimap(this.nav, this.spawns.all);
+        this.banner = new AreaBanner();
         this.chunks.onChunkLoaded = (cx, cz) => this.monsters.spawnForChunk(cx, cz);
         this.chunks.onChunkUnloaded = (cx, cz) => this.monsters.despawnForChunk(cx, cz);
         this.nav.onCellChanged = (cx, cz, gx, gz) => this.onCellChanged(cx, cz, gx, gz);
@@ -120,6 +123,7 @@ export class Main extends Laya.Script {
         Laya.stage.offAllCaller(this);
         this.hud?.destroy();
         this.minimap?.destroy();
+        this.banner?.destroy();
     }
 
     /** 收集场景里所有 SpawnPoint 组件（任意层级），转成运行时数据 */
@@ -165,10 +169,14 @@ export class Main extends Laya.Script {
         // 性能测试：屏蔽寻路线绘制（DRAW_PATHS 改回 true 恢复）
         if (DRAW_PATHS) this.drawPaths();
         this.minimap.update(p.pos, p.heading, this.monsters.monsters, this.marker.active ? p.finalTarget : null);
+        this.banner.update(dt, p.pos.x, p.pos.z);
         this.updateHud(dt);
     }
 
     private onClick() {
+        // 点在小地图/大地图上：寻路到对应的世界位置（不再穿透到地面）
+        const mapHit = this.minimap.pick(Laya.stage.mouseX, Laya.stage.mouseY);
+        if (mapHit) { this.walkTo(mapHit); return; }
         const hit = this.pickGround(Laya.stage.mouseX, Laya.stage.mouseY);
         if (!hit) return;
         const gx = Math.floor(hit.x / CELL), gz = Math.floor(hit.z / CELL);
@@ -360,10 +368,10 @@ export class Main extends Laya.Script {
         const p = this.player.pos;
         this.hud.text =
             `FPS ${this.fps}\n` +
-            `位置 (${p.x.toFixed(0)}, ${p.z.toFixed(0)})  块 (${Math.floor(p.x / CHUNK_SIZE)}, ${Math.floor(p.z / CHUNK_SIZE)})\n` +
+            `${this.banner.area}  位置 (${p.x.toFixed(0)}, ${p.z.toFixed(0)})  块 (${Math.floor(p.x / CHUNK_SIZE)}, ${Math.floor(p.z / CHUNK_SIZE)})\n` +
             `已加载块 ${this.chunks.loadedCount}  排队 ${this.chunks.queuedCount}  寻路数据缓存 ${this.nav.cachedCount}  已砍 ${this.chopCount}  地图修改 ${this.nav.editCount}\n` +
             `刷怪点 ${this.spawns.all.length}  怪物 ${this.monsters.monsters.length}  追击 ${this.monsters.chasingCount}  寻路排队 ${this.paths.pending}  寻路耗时 ${this.paths.lastFrameMs.toFixed(1)}ms\n` +
-            `左键点地面: 自动寻路   左键点树: 走过去砍掉   F(按住): 砍面前的树
+            `左键点地面/地图: 自动寻路   左键点树: 走过去砍掉   F(按住): 砍面前的树
 WASD: 移动   滚轮: 缩放   G: 前往远方   H: 去最近的山顶   M: 大地图`;
     }
 }

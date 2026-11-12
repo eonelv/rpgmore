@@ -2,9 +2,46 @@
  * 低多边形网格构建器：顶点格式 POSITION + NORMAL + COLOR（可选 + UV），平面着色（每个三角形独立法线）。
  * 一个块里的地形和所有物件合并成少量 Mesh，大量物体只需很少的 draw call。
  * 单个 Mesh 使用 16 位索引，顶点数接近上限时自动切分出新的 Mesh。
+ *
+ * 显存：构建时每个顶点是 10 或 12 个 float，上传前压缩成 20 / 28 字节
+ * （位置 3×float、法线 4×int8、颜色 4×uint8、UV 2×float），比全用 float 的 40 / 48 字节少四成。
  */
 const FLOATS_PER_VERTEX = 10;
 const MAX_VERTS = 65000;
+
+let packedOK: boolean | undefined;
+/** 引擎是否支持压缩用到的顶点格式（归一化的 int8 / uint8）；不支持就退回全 float 的格式 */
+function packedSupported(): boolean {
+    if (packedOK === undefined) {
+        try {
+            packedOK = !!Laya.VertexElementFormat.getElementInfos("nbyte4")
+                && !!Laya.VertexElementFormat.getElementInfos("ubyte4");
+        } catch (e) {
+            packedOK = false;
+        }
+    }
+    return packedOK;
+}
+
+const packedDecls: Laya.VertexDeclaration[] = [];
+/** 压缩顶点格式的声明：位置 float×3 | 法线 int8×4（归一化）| 颜色 uint8×4（归一化）| UV float×2（可选） */
+function packedDecl(withUV: boolean): Laya.VertexDeclaration {
+    const k = withUV ? 1 : 0;
+    if (!packedDecls[k]) {
+        const els = [
+            new Laya.VertexElement(0, "vector3", Laya.VertexMesh.MESH_POSITION0),
+            new Laya.VertexElement(12, "nbyte4", Laya.VertexMesh.MESH_NORMAL0),
+            new Laya.VertexElement(16, "ubyte4", Laya.VertexMesh.MESH_COLOR0),
+        ];
+        if (withUV) els.push(new Laya.VertexElement(20, "vector2", Laya.VertexMesh.MESH_TEXTURECOORDINATE0));
+        packedDecls[k] = new Laya.VertexDeclaration(withUV ? 28 : 20, els);
+    }
+    return packedDecls[k];
+}
+
+function toByte(v: number): number {
+    return v <= 0 ? 0 : v >= 1 ? 255 : Math.round(v * 255);
+}
 
 export type RGB = [number, number, number];
 const ZERO_UV = [0, 0, 0, 0, 0, 0];
@@ -16,8 +53,12 @@ function shadeTop(c: RGB): RGB {
 
 export class MeshBuilder {
     private verts: number[] = [];
+    private idx: number[] = [];
     private count = 0;
     private meshes: Laya.Mesh[] = [];
+
+    /** 每切分出一个新 Mesh 加 1：之前 addVertex 返回的顶点下标从此作废（见 reserve） */
+    epoch = 0;
 
     /** 自动投影 UV 时减去的水平原点（取块的原点，避免远处 UV 过大损失精度） */
     uvOriginX = 0;
@@ -59,6 +100,8 @@ export class MeshBuilder {
             v.push(cx, cy, cz, nx, ny, nz, col[0], col[1], col[2], a[2]); if (t) v.push(u[4], u[5]);
             v.push(bx, by, bz, nx, ny, nz, col[0], col[1], col[2], a[1]); if (t) v.push(u[2], u[3]);
         }
+        const n0 = this.count;
+        this.idx.push(n0, n0 + 1, n0 + 2);
         this.count += 3;
     }
 
@@ -80,6 +123,39 @@ export class MeshBuilder {
             uv && [uv[0], uv[1], uv[2], uv[3], uv[4], uv[5]], al && [al[0], al[1], al[2]]);
         this.tri(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], col, ref[0], ref[1], ref[2],
             uv && [uv[0], uv[1], uv[4], uv[5], uv[6], uv[7]], al && [al[0], al[2], al[3]]);
+    }
+
+    /**
+     * 共享顶点的平滑网格（山体）：先 reserve，再用 addVertex 加顶点（自带法线、颜色、alpha、UV），
+     * 用 addTri 按顶点下标连成三角形。相邻的面共用顶点，一个四边形平均只多 1 个顶点。
+     *
+     * reserve(n)：保证接下来 n 个顶点和已有顶点在同一个 Mesh 里。放不下时会切分出新 Mesh、epoch 加 1，
+     * 调用方缓存的顶点下标要全部丢掉重新加
+     */
+    reserve(n: number) {
+        if (this.count + n > MAX_VERTS) this.flush();
+    }
+
+    /** 添加一个顶点，返回它的下标（只在 epoch 不变时有效） */
+    addVertex(x: number, y: number, z: number, nx: number, ny: number, nz: number,
+        r: number, g: number, b: number, a: number, u = 0, v = 0): number {
+        this.verts.push(x, y, z, nx, ny, nz, r, g, b, a);
+        if (this.withUV) this.verts.push(u, v);
+        return this.count++;
+    }
+
+    /** 用三个顶点下标添加三角形；从正面看过去是顺时针（地面：从上往下看顺时针） */
+    addTri(a: number, b: number, c: number) {
+        this.idx.push(a, b, c);
+    }
+
+    /** 小凸起（花、果子）：底面边长 s 的四棱锥，不画底面，4 个三角形；两个面用 col、两个面用 topCol */
+    stud(x: number, y0: number, z: number, s: number, col: RGB, topCol: RGB) {
+        const r = s * 0.6, ty = y0 + s * 1.1, ry = y0 + s * 0.3;
+        this.tri(x - r, y0, z - r, x + r, y0, z - r, x, ty, z, col, x, ry, z);
+        this.tri(x + r, y0, z - r, x + r, y0, z + r, x, ty, z, topCol, x, ry, z);
+        this.tri(x + r, y0, z + r, x - r, y0, z + r, x, ty, z, col, x, ry, z);
+        this.tri(x - r, y0, z + r, x - r, y0, z - r, x, ty, z, topCol, x, ry, z);
     }
 
     /** 轴对齐盒子，(x,z) 为底面中心，y0 为底面高度 */
@@ -132,12 +208,17 @@ export class MeshBuilder {
      * 3 圈顶点 + 顶点，相邻两圈错开半格，形成三角切面；截面是椭圆 (rx, rz)，绕 y 轴转 rot。
      * bulge：中圈相对底圈的鼓出程度（>1 是圆鼓的大石头，<1 是往上收的石柱）；
      * moss：顶部的苔藓颜色（不传则没有苔藓）；
-     * seg：每圈顶点数，大石头用多一些；seg > 8 时多加一圈，顶部更圆，不会是尖锥
+     * seg：每圈顶点数，大石头用多一些；seg > 8 时多加一圈，顶部更圆，不会是尖锥；
+     * seg <= 4 时只有两圈（碎石用，seg×3 个三角形）；
+     * smooth：平滑着色（大石头用），三角形数不变，见 smoothRock
      */
     rock(x: number, y0: number, z: number, rx: number, rz: number, h: number, rot: number, col: RGB,
-        rand: (i: number) => number, bulge = 1, moss?: RGB, seg = 7) {
+        rand: (i: number) => number, bulge = 1, moss?: RGB, seg = 7, smooth = false) {
         const SEG = seg;
-        const levels = seg > 8 ? [
+        const levels = seg <= 4 ? [
+            { y: -0.2, r: 1.0 },
+            { y: 0.6, r: 0.72 * bulge },
+        ] : seg > 8 ? [
             { y: -0.2, r: 1.0 },
             { y: 0.38, r: bulge },
             { y: 0.72, r: 0.78 * bulge },
@@ -161,6 +242,10 @@ export class MeshBuilder {
         });
         const top = [x + (rand(60) - 0.5) * rx * 0.35, y0 + h, z + (rand(61) - 0.5) * rz * 0.35];
         const ref = [x, y0 + h * 0.4, z];
+        if (smooth) {
+            this.smoothRock(rings, top, ref, col, moss ?? shadeTop(col), rand);
+            return;
+        }
         let k = 0;
         const face = (c: RGB) => {
             const f = 0.86 + rand(70 + k++) * 0.26;
@@ -181,6 +266,87 @@ export class MeshBuilder {
         const R = rings[rings.length - 1];
         const topCol = moss ?? shadeTop(col);
         for (let i = 0; i < SEG; i++) T(R[i], R[(i + 1) % SEG], top, face(topCol));
+    }
+
+    /**
+     * 平滑着色的石头：和 rock 同样的顶点、同样多的三角形，但
+     * - 法线按顶点算（周围各面法线按面积加权平均），光照连续过渡，看不出一块块的三角面；
+     * - 颜色按顶点算（下面是 col，最上面一圈和顶点是 topCol，各带一点深浅变化），不再每个面一个颜色。
+     * 大石头离得近、面又大，平面着色时每个三角形的明暗和颜色都不一样，切面特别显眼。
+     * UV 仍按每个三角形自己的朝向投影，所以顶点不共用
+     */
+    private smoothRock(rings: number[][][], top: number[], ref: number[], col: RGB, topCol: RGB,
+        rand: (i: number) => number) {
+        const SEG = rings[0].length, L = rings.length;
+        const P: number[][] = [], C: RGB[] = [];
+        for (let l = 0; l < L; l++) {
+            for (let i = 0; i < SEG; i++) {
+                P.push(rings[l][i]);
+                const c = l >= 2 && l === L - 1 ? topCol : col;
+                const f = 0.93 + rand(70 + l * SEG + i) * 0.14;
+                C.push([Math.min(1, c[0] * f), Math.min(1, c[1] * f), Math.min(1, c[2] * f)]);
+            }
+        }
+        const ti = P.length;
+        P.push(top);
+        C.push(topCol);
+        const T: number[] = [];
+        for (let l = 0; l < L - 1; l++) {
+            const a = l * SEG, b = a + SEG;
+            for (let i = 0; i < SEG; i++) {
+                const n = (i + 1) % SEG, p = (i + SEG - 1) % SEG;
+                T.push(a + i, a + n, b + i, a + i, b + i, b + p);
+            }
+        }
+        const r0 = (L - 1) * SEG;
+        for (let i = 0; i < SEG; i++) T.push(r0 + i, r0 + (i + 1) % SEG, ti);
+
+        // 每个面的法线（没有归一化，长度 = 面积 × 2，朝外），累加到三个顶点上
+        const N = new Float32Array(P.length * 3);
+        const FNm = new Float32Array(T.length);
+        for (let t = 0; t < T.length; t += 3) {
+            const a = P[T[t]], b = P[T[t + 1]], c = P[T[t + 2]];
+            const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+            const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+            let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+            const mx = (a[0] + b[0] + c[0]) / 3 - ref[0], my = (a[1] + b[1] + c[1]) / 3 - ref[1],
+                mz = (a[2] + b[2] + c[2]) / 3 - ref[2];
+            if (nx * mx + ny * my + nz * mz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+            FNm[t] = nx; FNm[t + 1] = ny; FNm[t + 2] = nz;
+            for (let k = 0; k < 3; k++) {
+                const o = T[t + k] * 3;
+                N[o] += nx; N[o + 1] += ny; N[o + 2] += nz;
+            }
+        }
+        for (let o = 0; o < N.length; o += 3) {
+            const len = Math.hypot(N[o], N[o + 1], N[o + 2]) || 1;
+            N[o] /= len; N[o + 1] /= len; N[o + 2] /= len;
+        }
+
+        const out = this.verts, wUV = this.withUV;
+        for (let t = 0; t < T.length; t += 3) {
+            if (this.count + 3 > MAX_VERTS) this.flush();
+            const ia = T[t], ib = T[t + 1], ic = T[t + 2];
+            const a = P[ia], b = P[ib], c = P[ic];
+            const len = Math.hypot(FNm[t], FNm[t + 1], FNm[t + 2]) || 1;
+            const fx = FNm[t] / len, fy = FNm[t + 1] / len, fz = FNm[t + 2] / len;
+            const uv = wUV && this.uvTile > 0
+                ? this.projectUV(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], fx, fy, fz) : ZERO_UV;
+            const put = (i: number, k: number) => {
+                const p = P[i], col2 = C[i], o = i * 3;
+                out.push(p[0], p[1], p[2], N[o], N[o + 1], N[o + 2], col2[0], col2[1], col2[2], 1);
+                if (wUV) out.push(uv[k * 2], uv[k * 2 + 1]);
+            };
+            // 绕序：从法线方向看过去为顺时针（和 tri 一致）。a-b-c 的叉积朝外时要交换 b、c
+            const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+            const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+            const dot = (uy * vz - uz * vy) * fx + (uz * vx - ux * vz) * fy + (ux * vy - uy * vx) * fz;
+            if (dot < 0) { put(ia, 0); put(ib, 1); put(ic, 2); }
+            else { put(ia, 0); put(ic, 2); put(ib, 1); }
+            const n0 = this.count;
+            this.idx.push(n0, n0 + 1, n0 + 2);
+            this.count += 3;
+        }
     }
 
     /** 圆锥（不画底面），用于树冠 */
@@ -321,7 +487,7 @@ export class MeshBuilder {
      * cell 是 2×2 图集里的第几格
      */
     card(p: number[], u: number[], v: number[], half: number, n: number[], col: RGB, cell: number) {
-        if (this.count + 6 > MAX_VERTS) this.flush();
+        if (this.count + 4 > MAX_VERTS) this.flush();
         const u0 = (cell & 1) * 0.5 + 0.004, v0 = ((cell >> 1) & 1) * 0.5 + 0.004, d = 0.492;
         const out = this.verts;
         const vert = (su: number, sv: number) => {
@@ -329,22 +495,46 @@ export class MeshBuilder {
                 p[2] + (u[2] * su + v[2] * sv) * half, n[0], n[1], n[2], col[0], col[1], col[2], 1);
             if (this.withUV) out.push(u0 + (su + 1) * 0.5 * d, v0 + (sv + 1) * 0.5 * d);
         };
-        vert(-1, -1); vert(1, -1); vert(1, 1);
-        vert(-1, -1); vert(1, 1); vert(-1, 1);
-        this.count += 6;
+        // 四个角共用顶点：4 个顶点 + 6 个索引
+        vert(-1, -1); vert(1, -1); vert(1, 1); vert(-1, 1);
+        const n0 = this.count;
+        this.idx.push(n0, n0 + 1, n0 + 2, n0, n0 + 2, n0 + 3);
+        this.count += 4;
     }
 
     get vertexCount() { return this.count; }
 
     private flush() {
         if (this.count === 0) return;
-        const decl = Laya.VertexMesh.getVertexDeclaration(this.withUV ? "POSITION,NORMAL,COLOR,UV" : "POSITION,NORMAL,COLOR");
-        const vertices = new Float32Array(this.verts);
-        const indices = new Uint16Array(this.count);
-        for (let i = 0; i < this.count; i++) indices[i] = i;
-        this.meshes.push(Laya.PrimitiveMesh._createMesh(decl, vertices, indices));
+        const n = this.count, src = this.verts, t = this.withUV;
+        let decl: Laya.VertexDeclaration;
+        let vertices: Float32Array;
+        if (packedSupported()) {
+            // 压缩：法线和颜色各占 4 字节。同一块内存用 float / int8 / uint8 三种视图写入
+            const fpv = t ? 12 : 10, stride = t ? 28 : 20, w = stride / 4;
+            const buf = new ArrayBuffer(n * stride);
+            const f32 = new Float32Array(buf), i8 = new Int8Array(buf), u8 = new Uint8Array(buf);
+            for (let i = 0, s = 0; i < n; i++, s += fpv) {
+                const f = i * w, b = i * stride;
+                f32[f] = src[s]; f32[f + 1] = src[s + 1]; f32[f + 2] = src[s + 2];
+                i8[b + 12] = Math.round(src[s + 3] * 127);
+                i8[b + 13] = Math.round(src[s + 4] * 127);
+                i8[b + 14] = Math.round(src[s + 5] * 127);
+                u8[b + 16] = toByte(src[s + 6]); u8[b + 17] = toByte(src[s + 7]);
+                u8[b + 18] = toByte(src[s + 8]); u8[b + 19] = toByte(src[s + 9]);
+                if (t) { f32[f + 5] = src[s + 10]; f32[f + 6] = src[s + 11]; }
+            }
+            decl = packedDecl(t);
+            vertices = f32;
+        } else {
+            decl = Laya.VertexMesh.getVertexDeclaration(t ? "POSITION,NORMAL,COLOR,UV" : "POSITION,NORMAL,COLOR");
+            vertices = new Float32Array(src);
+        }
+        this.meshes.push(Laya.PrimitiveMesh._createMesh(decl, vertices, new Uint16Array(this.idx)));
         this.verts = [];
+        this.idx = [];
         this.count = 0;
+        this.epoch++;
     }
 
     build(): Laya.Mesh[] {

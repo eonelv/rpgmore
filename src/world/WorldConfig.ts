@@ -8,10 +8,22 @@ export const CHUNK_CELLS = 32;
 /** 每个块的边长（米） */
 export const CHUNK_SIZE = CELL * CHUNK_CELLS;
 
-/** 以玩家所在块为中心，加载半径内的块（2 => 5x5） */
+/** 以玩家所在块为中心，最多考虑加载半径内的块（2 => 5x5）；其中只加载距离不超过 LOAD_DIST 的 */
 export const LOAD_RADIUS = 2;
-/** 超出卸载半径的块会被回收；比加载半径大 1，避免在边界来回走时反复加载 */
-export const UNLOAD_RADIUS = 3;
+/**
+ * 玩家到块（最近的边）的距离（米）不超过 LOAD_DIST 才加载，超过 UNLOAD_DIST 就卸载。
+ * 雾在 145 米处全白，再远的块看不见，不用留在显存里；两个值差 16 米，在边界来回走不会反复加载。
+ * LOAD_DIST 不能超过 LOAD_RADIUS × CHUNK_SIZE
+ */
+export const LOAD_DIST = 128;
+export const UNLOAD_DIST = 144;
+/**
+ * 远处的块用简化版网格（省显存）：距离小于 LOD_NEAR_DIST 换成完整版，大于 LOD_FAR_DIST 换成简化版，
+ * 两者之间保持原样（避免来回走时反复重建）；新加载的块按 LOD_BUILD_DIST 决定
+ */
+export const LOD_NEAR_DIST = 56;
+export const LOD_BUILD_DIST = 72;
+export const LOD_FAR_DIST = 88;
 /** 寻路数据保留半径（块）。寻路数据很小，可以比画面保留得更远 */
 export const NAV_KEEP_RADIUS = 8;
 

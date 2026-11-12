@@ -4,6 +4,8 @@ import { SpawnInfo } from "../world/Spawns";
 import { rgbToCss, unitDef } from "../world/UnitDefs";
 import { NavGrid } from "../world/NavGrid";
 import { CHUNK_CELLS, CHUNK_SIZE, Cell, chunkKey } from "../world/WorldConfig";
+import { areaName, isNamedArea } from "../world/Areas";
+import { REGION } from "../world/WorldGen";
 
 /** 小地图上要画的怪物（只需要位置和种类） */
 export interface MapUnit { pos: Vec2; kind: string; state: string; }
@@ -97,8 +99,24 @@ export class Minimap {
         return t;
     }
 
+    /** 地图中心（玩家）的世界坐标，update 时记录，供点击换算用 */
+    private center: Vec2 | null = null;
+
+    /**
+     * 屏幕坐标是否落在地图上；落在地图上则返回对应的世界坐标，否则返回 null。
+     * 小地图和大地图通用（两者只是 size / range 不同）。
+     */
+    pick(sx: number, sy: number): Vec2 | null {
+        if (!this.center || !this.view.visible) return null;
+        const lx = sx - this.view.x, ly = sy - this.view.y, S = this.size;
+        if (lx < 0 || ly < 0 || lx > S || ly > S) return null;
+        const k = this.range / S;
+        return { x: this.center.x + (lx - S / 2) * k, z: this.center.z + (ly - S / 2) * k };
+    }
+
     update(player: Vec2, heading: number, units: MapUnit[], target: Vec2 | null) {
         const S = this.size, scale = S / this.range;
+        this.center = { x: player.x, z: player.z };
         const ox = player.x - this.range / 2, oz = player.z - this.range / 2;   // 左上角的世界坐标
         const toX = (wx: number) => (wx - ox) * scale, toY = (wz: number) => (wz - oz) * scale;
 
@@ -131,6 +149,17 @@ export class Minimap {
             const x = toX(s.x), y = toY(s.z), r = Math.max(3, s.radius * scale);
             if (x < -r || y < -r || x > S + r || y > S + r) continue;
             g.drawCircle(x, y, r, null, rgbToCss(unitDef(s.kind).color), 1);
+        }
+        // 区域名字：写在每个大区露在地图里的那部分的上方（小地图上当前区域的名字因此始终可见）
+        const fs = this.big ? 20 : 14, font = `bold ${fs}px Arial`;
+        for (let rz = Math.round(oz / REGION); rz <= Math.round((oz + this.range) / REGION); rz++) {
+            for (let rx = Math.round(ox / REGION); rx <= Math.round((ox + this.range) / REGION); rx++) {
+                const x0 = Math.max(0, toX((rx - 0.5) * REGION)), x1 = Math.min(S, toX((rx + 0.5) * REGION));
+                const y0 = Math.max(0, toY((rz - 0.5) * REGION)), y1 = Math.min(S, toY((rz + 0.5) * REGION));
+                if (x1 - x0 < fs * 4.5 || y1 - y0 < fs * 2.5) continue;   // 露出来的部分太小，写不下
+                g.fillBorderText(areaName(rx, rz), (x0 + x1) / 2, y0 + (y1 - y0) * 0.28 - fs / 2, font,
+                    isNamedArea(rx, rz) ? "#fff6d8" : "#cfd8e0", "center", 3, "#000000");
+            }
         }
         const dot = this.big ? 2 : 2.5;
         for (const u of units) {
