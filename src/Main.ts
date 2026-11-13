@@ -1,7 +1,8 @@
 import { SpawnPoint } from "./editor/SpawnPoint";
 import { AreaBanner } from "./ui/AreaBanner";
 import { Minimap } from "./ui/Minimap";
-import { MonsterManager, Player } from "./world/Actors";
+import { Monster, MonsterManager, Player } from "./world/Actors";
+import { ArrowManager } from "./world/Projectiles";
 import { ChunkManager } from "./world/ChunkManager";
 import { NavGrid } from "./world/NavGrid";
 import { PathService, Vec2 } from "./world/PathFinder";
@@ -14,10 +15,13 @@ const { regClass } = Laya;
 
 /** 是否绘制寻路线（排查手机帧率时临时关闭） */
 const DRAW_PATHS = false;
+/** 射箭时自动瞄准这个距离内最近的怪物（米） */
+const ATTACK_RANGE = 26;
 
 /**
  * 开放世界原型入口。
  * 操作：鼠标左键点击地面 → 主角自动寻路；点击小地图/大地图 → 寻路到地图上对应的位置；点击树 → 走过去砍掉；按住 F 砍面前的树；WASD 直接移动；滚轮缩放；
+ *      J / 空格 射箭（按住连射，自动瞄准附近最近的怪物）；
  *      G 键自动前往 1~2 公里外的随机地点（测试长距离分段寻路和流式加载）；H 键沿山路去最近的山顶（在山顶再按去下一座）；
  *      M 键切换小地图/大地图。
  * 刷怪点：在场景里任意位置放挂了 SpawnPoint 组件的节点，启动时自动收集。
@@ -30,6 +34,7 @@ export class Main extends Laya.Script {
     private paths = new PathService(this.nav, 3);
     private chunks: ChunkManager;
     private monsters: MonsterManager;
+    private arrows: ArrowManager;
     private player: Player;
     private lines: Laya.PixelLineSprite3D;
     private marker: Laya.MeshSprite3D;
@@ -70,6 +75,8 @@ export class Main extends Laya.Script {
         this.camera.clearFlag = Laya.CameraClearFlags.SolidColor;
         this.camera.clearColor = fog;
         this.camera.farPlane = 200;
+        // 多重采样抗锯齿：不开的话模型边缘和小细节是一格格的锯齿（手机上掉帧明显可以关掉）
+        this.camera.msaa = true;
 
         // 水面 shader 是资源文件，要先加载，否则水面材质会退回默认 shader
         await loadWaterShader();
@@ -79,6 +86,7 @@ export class Main extends Laya.Script {
         this.chunks = new ChunkManager(worldRoot, this.nav);
         this.collectSpawnPoints(this.scene3D);
         this.monsters = new MonsterManager(this.scene3D, this.nav, this.paths, this.spawns);
+        this.arrows = new ArrowManager(this.scene3D, this.nav, this.monsters);
         this.minimap = new Minimap(this.nav, this.spawns.all);
         this.banner = new AreaBanner();
         this.chunks.onChunkLoaded = (cx, cz) => this.monsters.spawnForChunk(cx, cz);
@@ -109,7 +117,8 @@ export class Main extends Laya.Script {
 
         Laya.stage.on(Laya.Event.MOUSE_DOWN, this, this.onClick);
         Laya.stage.on(Laya.Event.MOUSE_WHEEL, this, (e: Laya.Event) => {
-            this.camDist = Math.min(60, Math.max(10, this.camDist - e.delta * 0.02 * this.camDist));
+            // 最近可以拉到 3.5 米，角色占大半个屏幕，能看清脸和服装细节
+            this.camDist = Math.min(60, Math.max(3.5, this.camDist - e.delta * 0.02 * this.camDist));
         });
         Laya.stage.on(Laya.Event.KEY_DOWN, this, (e: Laya.Event) => {
             if (e.keyCode === Laya.Keyboard.G) this.travelFar();
@@ -148,7 +157,10 @@ export class Main extends Laya.Script {
         if (I.hasKeyDown(K.S) || I.hasKeyDown(K.DOWN)) mz += 1;
         if (I.hasKeyDown(K.A) || I.hasKeyDown(K.LEFT)) mx -= 1;
         if (I.hasKeyDown(K.D) || I.hasKeyDown(K.RIGHT)) mx += 1;
-        if (mx || mz) {
+        // 拉弓的一瞬间站定，箭射出去之后才能继续走
+        if (p.drawing) {
+            // 不移动
+        } else if (mx || mz) {
             this.chopTarget = null;
             if (p.path.length || p.pending) { p.cancelPath(); p.finalTarget = null; this.marker.active = false; }
             const len = Math.sqrt(mx * mx + mz * mz);
@@ -161,9 +173,12 @@ export class Main extends Laya.Script {
 
         this.updateChop(dt);
         if (I.hasKeyDown(K.F)) this.chopNearby();   // 按住 F 连续砍
+        if (I.hasKeyDown(K.J) || I.hasKeyDown(K.SPACE)) this.attack();   // 按住 J / 空格 连续射箭
 
         this.paths.update();
         this.monsters.update(dt, p.pos);
+        if (p.animate(dt)) this.releaseArrow();
+        this.arrows.update(dt);
         this.chunks.update(p.pos.x, p.pos.z);
         this.updateCamera(dt);
         // 性能测试：屏蔽寻路线绘制（DRAW_PATHS 改回 true 恢复）
@@ -182,6 +197,45 @@ export class Main extends Laya.Script {
         const gx = Math.floor(hit.x / CELL), gz = Math.floor(hit.z / CELL);
         if (chopResult(this.nav.kind(gx, gz)) !== null) this.walkToChop(gx, gz);
         else this.walkTo(hit);
+    }
+
+    // ---------------- 射箭 ----------------
+
+    /** 这一箭锁定的怪物（按下攻击键时选好，松手时再瞄一次） */
+    private atkTarget: Monster | null = null;
+    private muzzle = new Laya.Vector3();
+
+    /** 攻击键：停下脚步，转向射程内最近的怪物（没有就朝面前）开始拉弓 */
+    private attack() {
+        const p = this.player;
+        if (!p.canAttack) return;
+        this.chopTarget = null;
+        if (p.path.length || p.pending || p.finalTarget) { p.cancelPath(); p.finalTarget = null; this.marker.active = false; }
+        this.atkTarget = this.monsters.nearest(p.pos, ATTACK_RANGE);
+        this.faceTarget();
+        p.startAttack();
+    }
+
+    private faceTarget() {
+        const p = this.player, t = this.atkTarget;
+        if (!t || t.dead) return;
+        p.heading = Math.atan2(t.pos.x - p.pos.x, t.pos.z - p.pos.z);
+        p.syncNode();
+    }
+
+    /** 拉满松手：从弓的位置射出一支箭 */
+    private releaseArrow() {
+        const p = this.player;
+        this.faceTarget();
+        p.muzzle(this.muzzle);
+        const t = this.atkTarget && !this.atkTarget.dead ? this.atkTarget : null;
+        if (t) this.arrows.fire(this.muzzle, t.pos.x, t.centerY, t.pos.z, t);
+        else {
+            // 没有目标：朝面前 20 米处齐胸高的位置射（上下坡时箭跟着地势走）
+            const tx = p.pos.x + Math.sin(p.heading) * 20, tz = p.pos.z + Math.cos(p.heading) * 20;
+            this.arrows.fire(this.muzzle, tx, groundY(tx, tz) + 1, tz, null);
+        }
+        this.atkTarget = null;
     }
 
     // ---------------- 砍树 ----------------
@@ -370,8 +424,8 @@ export class Main extends Laya.Script {
             `FPS ${this.fps}\n` +
             `${this.banner.area}  位置 (${p.x.toFixed(0)}, ${p.z.toFixed(0)})  块 (${Math.floor(p.x / CHUNK_SIZE)}, ${Math.floor(p.z / CHUNK_SIZE)})\n` +
             `已加载块 ${this.chunks.loadedCount}  排队 ${this.chunks.queuedCount}  寻路数据缓存 ${this.nav.cachedCount}  已砍 ${this.chopCount}  地图修改 ${this.nav.editCount}\n` +
-            `刷怪点 ${this.spawns.all.length}  怪物 ${this.monsters.monsters.length}  追击 ${this.monsters.chasingCount}  寻路排队 ${this.paths.pending}  寻路耗时 ${this.paths.lastFrameMs.toFixed(1)}ms\n` +
-            `左键点地面/地图: 自动寻路   左键点树: 走过去砍掉   F(按住): 砍面前的树
+            `刷怪点 ${this.spawns.all.length}  怪物 ${this.monsters.monsters.length}  追击 ${this.monsters.chasingCount}  击杀 ${this.monsters.kills}  箭 ${this.arrows.count}  粒子 ${this.arrows.particleCount}  寻路排队 ${this.paths.pending}  寻路耗时 ${this.paths.lastFrameMs.toFixed(1)}ms\n` +
+            `左键点地面/地图: 自动寻路   左键点树: 走过去砍掉   F(按住): 砍面前的树   J / 空格(按住): 射箭
 WASD: 移动   滚轮: 缩放   G: 前往远方   H: 去最近的山顶   M: 大地图`;
     }
 }
