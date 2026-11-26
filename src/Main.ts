@@ -11,6 +11,7 @@ import { PathService, Vec2 } from "./world/PathFinder";
 import { SpawnRegistry } from "./world/Spawns";
 import { CELL, CHUNK_CELLS, CHUNK_SIZE, chopResult } from "./world/WorldConfig";
 import { loadWaterShader } from "./world/WaterShader";
+import { Weather } from "./world/Weather";
 import { groundY, nearestMountainTop, spawnPoint } from "./world/WorldGen";
 
 const { regClass } = Laya;
@@ -62,6 +63,7 @@ export class Main extends Laya.Script {
     private spawns = new SpawnRegistry();
     private minimap: Minimap;
     private banner: AreaBanner;
+    private weather: Weather;
 
     private camDist = 26;
     /** 镜头绕角色的水平角（弧度）：0 = 镜头在角色的 +Z 方向，朝 -Z 看 */
@@ -91,14 +93,10 @@ export class Main extends Laya.Script {
             return;
         }
 
-        // 雾和背景同色，远处的块在雾中淡入，看不到加载边界
-        const fog = new Laya.Color(0.62, 0.75, 0.88, 1);
-        this.scene3D.enableFog = true;
-        this.scene3D.fogColor = fog;
-        this.scene3D.fogStart = 70;
-        this.scene3D.fogRange = 75;
+        // 雾和背景同色，远处的块在雾中淡入，看不到加载边界。
+        // 雾色、雾距离、环境光每帧由 Weather 按主角所在的地貌设置
         this.camera.clearFlag = Laya.CameraClearFlags.SolidColor;
-        this.camera.clearColor = fog;
+        this.weather = new Weather(this.scene3D, this.camera);
         this.camera.farPlane = 200;
         // 多重采样抗锯齿：不开的话模型边缘和小细节是一格格的锯齿。
         // 手机上关掉：多一个全屏的多重采样缓冲和一次解析，叶子的 alpha 裁切在多重采样下也更费
@@ -129,6 +127,8 @@ export class Main extends Laya.Script {
         const start = spawnPoint();
         this.player = new Player(this.scene3D, { x: (start.gx + 0.5) * CELL, z: (start.gz + 0.5) * CELL }, this.nav);
         this.chunks.warmUp(this.player.pos.x, this.player.pos.z);
+        // 先按出生点的地貌设好雾和环境光（不做时间过渡）
+        this.weather.update(0, this.player.pos.x, this.player.pos.z);
 
         this.lines = new Laya.PixelLineSprite3D(4000);
         this.scene3D.addChild(this.lines);
@@ -269,6 +269,7 @@ export class Main extends Laya.Script {
         if (DRAW_PATHS) this.drawPaths();
         this.minimap.update(p.pos, p.heading, this.monsters.monsters, this.marker.active ? p.finalTarget : null);
         this.banner.update(dt, p.pos.x, p.pos.z);
+        this.weather.update(dt, p.pos.x, p.pos.z);
         this.updateHud(dt);
     }
 
@@ -537,6 +538,7 @@ export class Main extends Laya.Script {
             on: () => !this.chunks.isLayerHidden(layers[0]),
         }));
         items.push({ name: "MSAA", toggle: () => { this.camera.msaa = !this.camera.msaa; }, on: () => this.camera.msaa });
+        items.push({ name: "天气粒子", toggle: () => { this.weather.particlesOn = !this.weather.particlesOn; }, on: () => this.weather.particlesOn });
         items.forEach((it, i) => {
             const t = new Laya.Text();
             t.text = it.name;
@@ -585,7 +587,7 @@ export class Main extends Laya.Script {
         const p = this.player.pos;
         this.hud.text =
             `FPS ${this.fps}   生命 ${Math.ceil(this.player.hp)}/${this.player.maxHp}\n` +
-            `${this.banner.area}  位置 (${p.x.toFixed(0)}, ${p.z.toFixed(0)})  块 (${Math.floor(p.x / CHUNK_SIZE)}, ${Math.floor(p.z / CHUNK_SIZE)})\n` +
+            `${this.banner.area}  ${this.weather.describe(p.x, p.z)}  位置 (${p.x.toFixed(0)}, ${p.z.toFixed(0)})  块 (${Math.floor(p.x / CHUNK_SIZE)}, ${Math.floor(p.z / CHUNK_SIZE)})\n` +
             `已加载块 ${this.chunks.loadedCount}  排队 ${this.chunks.queuedCount}  寻路数据缓存 ${this.nav.cachedCount}  已砍 ${this.chopCount}  地图修改 ${this.nav.editCount}\n` +
             `刷怪点 ${this.spawns.all.length}  怪物 ${this.monsters.monsters.length}  追击 ${this.monsters.chasingCount}  击杀 ${this.monsters.kills}  箭 ${this.arrows.count}  石头 ${this.rocks.count}  粒子 ${this.particles.count}  寻路排队 ${this.paths.pending}  寻路耗时 ${this.paths.lastFrameMs.toFixed(1)}ms\n` +
             (this.touch

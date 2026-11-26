@@ -6,6 +6,7 @@ import {
     barkTexture, foliageTexture, leafCardTexture, pineTexture, graniteTexture, grassTexture, gravelTexture, plankTexture, rockTexture, sandTexture, strataTexture, trailTexture,
 } from "./TerrainTextures";
 import { CELL, CHUNK_CELLS, CHUNK_SIZE, Cell, SEED } from "./WorldConfig";
+import { LP, biomeLook } from "./Biome";
 import {
     ChunkData, MOUNTAIN_TRAIL_HALF, SAND_NOISE, WATER_NOISE, WATER_Y, WALK_MIN_Y, chunkHasMountainTrail,
     mountainTrailDistance, onRegularRoad,
@@ -49,11 +50,51 @@ function mountainGrass(h: number, slope: number): number {
     return 1 - smoothstep(0.35, 0.8, (h - 4) / 7 + slope * 0.75);
 }
 
-/** 山体岩石的颜色（乘岩石贴图）：越高越浅 -> 积雪；雪线附近犬牙交错，陡坡上积不住雪 */
-function mountainRockColor(h: number, slope: number, jitter: number): RGB {
+/**
+ * 山体岩石的颜色（乘岩石贴图）：越高越浅 -> 积雪；雪线附近犬牙交错，陡坡上积不住雪。
+ * snowLine 按地貌取（LP.SnowLine，默认 SNOW_LINE；北域很低，整座山都是雪，只有陡坡露出岩石）
+ */
+function mountainRockColor(h: number, slope: number, jitter: number, snowLine = SNOW_LINE): RGB {
     const c = mix(MTN_ROCK, MTN_ROCK_HI, (h - 10) / 14);
-    const snow = (h - SNOW_LINE + jitter * 4) / 3 - slope * 0.8;
+    const snow = (h - snowLine + jitter * 4) / 3 - slope * 0.8;
     return mix(c, SNOW, snow);
+}
+
+/** 默认草色和山上草色的比例：山上的草按这个比例从地貌草色变暗 */
+const MTN_GRASS_RATIO: RGB = [
+    MTN_GRASS[0] / COLORS[Cell.Grass][0], MTN_GRASS[1] / COLORS[Cell.Grass][1], MTN_GRASS[2] / COLORS[Cell.Grass][2],
+];
+
+/** 外观参数的拷贝（biomeLook 返回共享数组，要长期保留的先拷贝一份） */
+function copyLook(wx: number, wz: number, out = new Float32Array(LOOK_LEN)): Float32Array {
+    out.set(biomeLook(wx, wz));
+    return out;
+}
+const LOOK_LEN = biomeLook(0, 0).length;
+
+function lookGrass(L: Float32Array): RGB { return [L[LP.GrassR], L[LP.GrassG], L[LP.GrassB]]; }
+function lookSand(L: Float32Array): RGB { return [L[LP.SandR], L[LP.SandG], L[LP.SandB]]; }
+function lookLeaf(L: Float32Array): RGB { return [L[LP.LeafR], L[LP.LeafG], L[LP.LeafB]]; }
+
+/**
+ * 格子在小地图上的颜色：草地、树、灌木、树桩按地貌草色调色，沙地用地貌沙色，其余用 COLORS。
+ * (wx,wz) 是格子中心
+ */
+export function cellColor(kind: number, wx: number, wz: number): RGB {
+    const base = COLORS[kind] ?? [1, 0, 1];
+    if (kind === Cell.Sand) {
+        const L = biomeLook(wx, wz);
+        return [L[LP.SandR], L[LP.SandG], L[LP.SandB]];
+    }
+    if (kind === Cell.Grass || kind === Cell.Tree || kind === Cell.Bush || kind === Cell.Stump) {
+        const L = biomeLook(wx, wz), g = COLORS[Cell.Grass];
+        return [
+            Math.min(1, base[0] * L[LP.GrassR] / g[0]),
+            Math.min(1, base[1] * L[LP.GrassG] / g[1]),
+            Math.min(1, base[2] * L[LP.GrassB] / g[2]),
+        ];
+    }
+    return base;
 }
 
 /** 山体格子每边细分的段数：寻路格子 2 米，山体网格 1 米 */
@@ -69,6 +110,7 @@ function mountainDetail(wx: number, wz: number): number {
     return fbm(wx / 6, wz / 6, 2, SEED + 1300) * 2 - 1;
 }
 const TRUNK: RGB = [0.40, 0.27, 0.16];
+/** 默认叶色，灌木按地貌叶色相对它的比例调色 */
 const LEAF: RGB = [0.16, 0.42, 0.20];
 const LEAF_LIGHT: RGB = [0.42, 0.62, 0.24];
 const LEAF_YELLOW: RGB = [0.74, 0.66, 0.20];
@@ -182,10 +224,12 @@ function trailAlpha(d: number): number {
     return t <= 0 ? 0 : 0.55 + 0.42 * Math.min(1, t);
 }
 
-/** 草地边缘下面垫的地面颜色（被裁掉的地方露出来的颜色） */
-function underColor(kind: number): RGB {
+/** 草地边缘下面垫的地面颜色（被裁掉的地方露出来的颜色），草地、沙地按地貌取色 */
+function underColor(kind: number, look: Float32Array): RGB {
     if (kind === Cell.Mountain) return MTN_ROCK;
     if (kind === Cell.Bridge) return COLORS[Cell.Water];
+    if (kind === Cell.Sand) return lookSand(look);
+    if (kind === Cell.Grass) return lookGrass(look);
     return COLORS[kind];
 }
 
@@ -344,14 +388,21 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
 
     // VG：草地层的顶点颜色 = 周围 4 格草色的平均（山体格用山上的草色，石头格偏暗，各带逐格的深浅变化）。
     // 颜色在格子内渐变，看不出一格一格的色块；平地和山体的草地层在共享边上用同一份颜色，交界处没有色差
+    // 草色按顶点所在位置的地貌取（世界坐标的连续函数，相邻块在共享边上一致）
+    // SL：顶点处的雪线（米）
     const VGR = new Float32Array(V * V), VGG = new Float32Array(V * V), VGB = new Float32Array(V * V);
+    const SL = new Float32Array(V * V);
     for (let z = 0; z <= N; z++) {
         for (let x = 0; x <= N; x++) {
+            const L = biomeLook((gx0 + x) * CELL, (gz0 + z) * CELL);
+            const flat: RGB = [L[LP.GrassR], L[LP.GrassG], L[LP.GrassB]];
+            const mtn: RGB = [flat[0] * MTN_GRASS_RATIO[0], flat[1] * MTN_GRASS_RATIO[1], flat[2] * MTN_GRASS_RATIO[2]];
+            SL[z * V + x] = L[LP.SnowLine];
             let r = 0, g = 0, b = 0;
             for (let j = -1; j <= 0; j++) {
                 for (let i = -1; i <= 0; i++) {
                     const k = kindAt(x + i, z + j), jt = hash2(gx0 + x + i, gz0 + z + j, SEED + 3);
-                    const c = k === Cell.Mountain ? MTN_GRASS : COLORS[Cell.Grass];
+                    const c = k === Cell.Mountain ? mtn : flat;
                     const f = k === Cell.Mountain ? 0.94 + jt * 0.12 : k === Cell.Rock ? 0.88 + jt * 0.06 : 0.97 + jt * 0.06;
                     r += c[0] * f; g += c[1] * f; b += c[2] * f;
                 }
@@ -436,7 +487,7 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
                 const wx = ox + i * MTN_STEP, wz = oz + j * MTN_STEP;
                 const jit = valueNoise(wx / 3, wz / 3, SEED + 3);
                 const lit = 0.84 + 0.32 * (d * 0.5 + 0.5);
-                const rc = shade(mountainRockColor(h, Math.hypot(sx, sz) * 1.2, jit), lit * TEX_GAIN);
+                const rc = shade(mountainRockColor(h, Math.hypot(sx, sz) * 1.2, jit, lerp(SL)), lit * TEX_GAIN);
                 FRC[k3] = rc[0]; FRC[k3 + 1] = rc[1]; FRC[k3 + 2] = rc[2];
                 // 草地层颜色用格子顶点颜色 VG 的插值：和旁边平地的草地层在共享边上完全一样
                 FGC[k3] = lerp(VGR); FGC[k3 + 1] = lerp(VGG); FGC[k3 + 2] = lerp(VGB);
@@ -509,6 +560,7 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
     };
 
     yield;
+    const cellLook = new Float32Array(LOOK_LEN);
     for (let lz = 0; lz < N; lz++) {
         for (let lx = 0; lx < N; lx++) {
             const kind = kindAt(lx, lz);
@@ -523,20 +575,21 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
             const jitter = hash2(gx, gz, SEED + 3);
             const hAvg = (h00 + h10 + h01 + h11) / 4;
             const slope = (Math.max(h00, h10, h01, h11) - Math.min(h00, h10, h01, h11)) / CELL;
+            const cxw = (x0 + x1) / 2, czw = (z0 + z1) / 2;
+            // 格子中心的地貌外观（拷贝一份，下面会多次用到）
+            const look = copyLook(cxw, czw, cellLook);
+            const snowLine = look[LP.SnowLine];
             let col: RGB;
             if (kind === Cell.Mountain) {
-                col = shade(mountainRockColor(hAvg, slope, jitter), (0.94 + jitter * 0.12) * TEX_GAIN);
+                col = shade(mountainRockColor(hAvg, slope, jitter, snowLine), (0.94 + jitter * 0.12) * TEX_GAIN);
             } else if (isGrassGround(kind)) {
                 // 石头格子的地面也是草地（石头长在草里），颜色用草地的，稍暗一点像被石头挡住了光
-                col = kind === Cell.Rock
-                    ? shade(COLORS[Cell.Grass], (0.88 + jitter * 0.06) * TEX_GAIN)
-                    : shade(COLORS[kind], (0.97 + jitter * 0.06) * TEX_GAIN);
+                col = shade(lookGrass(look), (kind === Cell.Rock ? 0.88 + jitter * 0.06 : 0.97 + jitter * 0.06) * TEX_GAIN);
             } else if (isSandGround(kind)) {
-                col = shade(COLORS[kind], (0.97 + jitter * 0.06) * TEX_GAIN);
+                col = shade(lookSand(look), (0.97 + jitter * 0.06) * TEX_GAIN);
             } else {
                 col = shade(COLORS[kind], 0.92 + jitter * 0.16);
             }
-            const cxw = (x0 + x1) / 2, czw = (z0 + z1) / 2;
             const ref = [cxw, -1000, czw];   // 参考点在下方 => 法线朝上
             const grassCell = isGrassGround(kind), sandCell = isSandGround(kind);
             const textured = grassCell || sandCell;
@@ -559,7 +612,7 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
                     // 挨着路的草地边缘下面垫砂石，被裁掉的地方和路面是同一种材质
                     if (nk === Cell.Road) gravelQuad(gravel, lx, lz, x0, z0, h00, h10, h11, h01, ref);
                     else if (nk >= 0) mb.quad([x0, h00, z0], [x1, h10, z0], [x1, h11, z1], [x0, h01, z1],
-                        shade(underColor(nk), 0.92 + jitter * 0.16), ref);
+                        shade(underColor(nk, look), 0.92 + jitter * 0.16), ref);
                 }
             }
             // 草地层
@@ -584,20 +637,37 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
             }
             // 沙地层
             if (sandCell || sMax > 0.5) {
-                const scol = sandCell ? col : shade(COLORS[Cell.Sand], (0.97 + jitter * 0.06) * TEX_GAIN);
+                const scol = sandCell ? col : shade(lookSand(look), (0.97 + jitter * 0.06) * TEX_GAIN);
                 groundQuad(sand, lx, lz, SAND_LIFT, SAND_TILE, sal, scol);
             }
 
             const baseY = Math.max(Math.min(h00, h10, h01, h11), WALK_MIN_Y - 0.3);
             const r = hash2(gx, gz, SEED + 99);
+            // 芦苇：挨着水的草地、沙地格子（只是画面，格子仍然可以走）
+            if ((kind === Cell.Grass || kind === Cell.Sand) && !far && look[LP.Reed] > 0 &&
+                hash2(gx, gz, SEED + 5400) < look[LP.Reed]) {
+                let wet = false;
+                for (const [dx, dz] of NEIGHBORS8) if (kindAt(lx + dx, lz + dz) === Cell.Water) { wet = true; break; }
+                if (wet) reedCell(veg, gx, gz, cxw, baseY, czw, look);
+            }
             switch (kind) {
                 case Cell.Tree:
-                    treeCell(veg, gx, gz, cxw, baseY, czw, 0.8 + r * 0.6, LEAF);
+                    treeCell(veg, gx, gz, cxw, baseY, czw, 0.8 + r * 0.6, lookLeaf(look), false, look);
                     break;
                 case Cell.Mountain: {
                     // 山上的装饰（只是画面，山体格子本来就不可走）：长草的地方有树，裸露的岩石上有大石块
-                    // 山路和路边不放（tMax > 0 表示格子挨着山路）
-                    if (hAvg > SNOW_LINE - 3 || tMax > 0 || isTrail(lx, lz)) break;
+                    // 山路和路边不放（tMax > 0 表示格子挨着山路）。雪线很低（北域）时山上只有零星的雪松
+                    const snowy = snowLine < 0;
+                    if ((!snowy && hAvg > snowLine - 3) || tMax > 0 || isTrail(lx, lz)) break;
+                    if (snowy) {
+                        if (r < 0.04 && slope < 1.0) {
+                            const fx = 0.25 + 0.5 * hash2(gx, gz, SEED + 101), fz = 0.25 + 0.5 * hash2(gx, gz, SEED + 102);
+                            const py = fineY((lx + fx) * MTN_SUB, (lz + fz) * MTN_SUB);
+                            treeCell(veg, gx, gz, x0 + fx * CELL, py - 0.25 - slope * 0.3, z0 + fz * CELL, 0.9,
+                                mix(lookLeaf(look), SNOW, 0.35), true, look, 0);
+                        }
+                        break;
+                    }
                     const cg = (MG[i00] + MG[i10] + MG[i01] + MG[i11]) / 4;
                     // 偏离格子中心，避免排成网格；高度取细分网格上该点的高度，往下埋一点防止在坡上悬空
                     const fx = 0.25 + 0.5 * hash2(gx, gz, SEED + 101), fz = 0.25 + 0.5 * hash2(gx, gz, SEED + 102);
@@ -605,14 +675,16 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
                     const py = fineY((lx + fx) * MTN_SUB, (lz + fz) * MTN_SUB);
                     if (cg > 0.45 && slope < 1.3 && r < 0.12 + cg * 0.33) {
                         // 越高越偏黄，山顶附近有整棵变红的
-                        const autumn = smoothstep(SNOW_LINE - 16, SNOW_LINE - 4, py);
+                        // 秋色丘陵、山谷（红叶权重高）整座山都偏秋色
+                        const leaf0 = lookLeaf(look);
+                        const autumn = Math.max(smoothstep(snowLine - 16, snowLine - 4, py), Math.min(1, look[LP.Red] * 1.2));
                         const red = hash2(gx, gz, SEED + 103) < autumn * 0.7;
-                        const leaf = red ? mix(LEAF, LEAF_RED, 0.55 + autumn * 0.45)
-                            : mix(LEAF, LEAF_YELLOW, autumn * 0.85);
+                        const leaf = red ? mix(leaf0, LEAF_RED, 0.55 + autumn * 0.45)
+                            : mix(leaf0, LEAF_YELLOW, autumn * 0.85);
                         const s = (0.75 + hash2(gx, gz, SEED + 104) * 0.6) * (0.8 + cg * 0.2);
-                        treeCell(veg, gx, gz, px, py - 0.25 - slope * 0.3, pz, s, leaf, true);
+                        treeCell(veg, gx, gz, px, py - 0.25 - slope * 0.3, pz, s, leaf, true, look);
                     } else if (cg < 0.5 && r > 0.93) {
-                        const bc = shade(mountainRockColor(hAvg, 0, jitter), 0.92 + jitter * 0.12);
+                        const bc = shade(mountainRockColor(hAvg, 0, jitter, snowLine), 0.92 + jitter * 0.12);
                         mb.boulder(px, py - slope * 0.4, pz, 0.6 + hash2(gx, gz, SEED + 105) * 0.8, bc,
                             i => hash2(gx * 64 + i, gz, SEED + 106));
                     }
@@ -639,7 +711,7 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
                     break;
                 }
                 case Cell.Bush:
-                    bushCell(veg, gx, gz, cxw, baseY, czw, jitter);
+                    bushCell(veg, gx, gz, cxw, baseY, czw, jitter, look);
                     break;
                 case Cell.Stump:
                     veg.bark.box(cxw, baseY, czw, 0.45, 0.3, 0.45, shade(TRUNK, TEX_GAIN), shade([0.75, 0.6, 0.4], TEX_GAIN));
@@ -683,13 +755,14 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
  * 3 蕨丛/高草（一簇从中心向外铺开的单片叶子，中间垫一小团叶簇）。
  * 叶簇是底暗顶亮的低多边形团块；尺寸基本占满格子，成片的灌木格子会连成一整片树篱
  */
-function bushCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, jitter: number) {
+function bushCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, jitter: number, look: Float32Array) {
     const rnd = (k: number) => (i: number) => hash2(gx * 101 + i, gz * 83 + k, SEED + 4500);
     const h = (k: number) => hash2(gx, gz, SEED + 4600 + k);
     const variant = Math.floor(h(0) * 4);
     const R = CELL * 0.5;
-    // 叶子乘树叶贴图，颜色要补偿贴图的平均亮度
-    const T = (c: RGB) => shade(c, TEX_GAIN);
+    // 叶子乘树叶贴图，颜色要补偿贴图的平均亮度；按地貌叶色相对默认叶色的比例调色（荒原偏黄、北域发白）
+    const tint: RGB = [look[LP.LeafR] / LEAF[0], look[LP.LeafG] / LEAF[1], look[LP.LeafB] / LEAF[2]];
+    const T = (c: RGB) => shade([c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]], TEX_GAIN);
     // 每格的叶色在深绿和黄绿之间变化
     const base = T(mix(BUSH_DARK, BUSH, 0.55 + jitter * 0.45));
     const light = T(mix(BUSH, BUSH_LIGHT, 0.4 + h(1) * 0.6));
@@ -798,26 +871,119 @@ function palmChance(x: number, z: number): number {
 }
 
 /**
- * 一棵树，按格子哈希从四种造型里选一种：
+ * 选树种：0 松树、1 阔叶、2 红叶、3 棕榈、4 枯树、5 柳树。
+ * 1. 水边棕榈：palmChance × LP.PalmShore；
+ * 2. 松树：LP.PineBase + LP.PineStand × 松林噪声（山上另有规则）；
+ * 3. 其余按各树种权重（LP.Broad / Red / Dead / Willow / Palm）抽取，柳树只长在水边。
+ * 过渡带的权重是两种地貌插值的结果，两边的树混生。look 为空时用改动前的规则
+ */
+function pickTree(x: number, z: number, mountain: boolean, look: Float32Array | undefined, h: (k: number) => number): number {
+    const shore = mountain ? 0 : palmChance(x, z);   // > 0 表示在水边
+    const palmP = look ? Math.min(0.95, shore * look[LP.PalmShore]) : shore;
+    if (h(0) < palmP) return 3;
+    // 松树成片：低频噪声划出松林，松林里绝大多数是松树，松林外只有零星几棵；山上松树本来就多
+    const stand = smoothstep(0.45, 0.6, fbm(x / 45, z / 45, 2, SEED + 4700));
+    const pineP = mountain ? 0.3 + 0.62 * stand
+        : look ? look[LP.PineBase] + look[LP.PineStand] * stand : 0.05 + 0.87 * stand;
+    if (h(6) < pineP) return 0;
+    // 山上：阔叶和秋色红叶（颜色由调用方按高度给），不出枯树、柳树、棕榈
+    if (!look || mountain) return h(7) < 0.66 ? 1 : 2;
+    const broad = look[LP.Broad], red = look[LP.Red], dead = look[LP.Dead];
+    const willow = shore > 0 ? look[LP.Willow] : 0, palm = mountain ? 0 : look[LP.Palm];
+    const sum = broad + red + dead + willow + palm;
+    if (sum <= 0) return 1;
+    let t = h(7) * sum;
+    if ((t -= broad) < 0) return 1;
+    if ((t -= red) < 0) return 2;
+    if ((t -= dead) < 0) return 4;
+    if ((t -= willow) < 0) return 5;
+    return 3;
+}
+
+const DEAD_BARK: RGB = [0.44, 0.38, 0.32];
+
+/** 枯树：微微倾斜的树干，3~5 根往上斜伸的枯枝（近处的枝梢再分一根细枝），没有叶子 */
+function deadTree(v: Veg, x: number, y: number, z: number, s: number, rot: number, h: (k: number) => number) {
+    const col = shade(DEAD_BARK, (0.85 + h(2) * 0.25) * TEX_GAIN);
+    const ht = (2.6 + h(3) * 1.4) * s;
+    const tx = x + Math.cos(rot) * 0.3 * s, tz = z + Math.sin(rot) * 0.3 * s;
+    v.bark.prism(x, y, z, 0.24 * s, tx, y + ht, tz, 0.06 * s, col, 5, rot);
+    const n = 3 + Math.floor(h(4) * 3);
+    for (let k = 0; k < n; k++) {
+        const t = 0.35 + 0.55 * (k + h(5 + k) * 0.5) / n;
+        const bx = x + (tx - x) * t, by = y + ht * t, bz = z + (tz - z) * t;
+        const a = rot + k * 2.4 + (h(10 + k) - 0.5) * 0.8;
+        const out = (0.7 + h(20 + k) * 0.8) * s * (1 - t * 0.4), up = (0.4 + h(30 + k) * 0.7) * s;
+        const ex = bx + Math.cos(a) * out, ey = by + up, ez = bz + Math.sin(a) * out;
+        v.bark.prism(bx, by, bz, 0.09 * s * (1 - t * 0.5), ex, ey, ez, 0.025 * s, col, 4, a);
+        if (!v.far && h(40 + k) < 0.6) {
+            const a2 = a + (h(50 + k) - 0.5) * 1.8, l2 = out * 0.45;
+            v.bark.prism(ex, ey, ez, 0.03 * s, ex + Math.cos(a2) * l2, ey + l2 * 0.6, ez + Math.sin(a2) * l2, 0.01 * s, col, 3, a2);
+        }
+    }
+}
+
+/** 柳树：粗短的树干，扁宽的树冠，树冠边上一圈垂下来的叶帘 */
+function willowTree(v: Veg, x: number, y: number, z: number, s: number, rot: number, leaf: RGB,
+    h: (k: number) => number, rnd: (k: number) => (i: number) => number) {
+    const T = (c: RGB, f = 1) => shade(c, f * TEX_GAIN);
+    const top = y + 2.3 * s;
+    const lean = (h(3) - 0.5) * 0.6 * s;
+    const tx = x + Math.cos(rot) * lean, tz = z + Math.sin(rot) * lean;
+    v.bark.prism(x, y, z, 0.32 * s, tx, top, tz, 0.2 * s, T(TRUNK, 0.8 + h(2) * 0.2), 6, rot);
+    const col = T(mix(leaf, LEAF_LIGHT, 0.35)), light = T(mix(leaf, LEAF_LIGHT, 0.7));
+    crown(v, tx, top + 0.8 * s, tz, 1.6 * s, 0.75 * s, 1.5 * s, col, light, rnd(0), 12);
+    // 叶帘：树冠边上一圈竖着的叶簇面片，上沿藏在树冠里，下沿垂到树冠下面
+    const n = v.far ? 7 : 12;
+    for (let k = 0; k < n; k++) {
+        const a = rot + (k / n) * Math.PI * 2 + (h(60 + k) - 0.5) * 0.4;
+        const r = (1.25 + h(70 + k) * 0.4) * s, half = (0.6 + h(80 + k) * 0.25) * s;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const nl = Math.hypot(ca, 0.3, sa);
+        v.card.card([tx + ca * r, top + 0.7 * s - half, tz + sa * r], [-sa, 0, ca], [0, 1, 0], half,
+            [ca / nl, 0.3 / nl, sa / nl], shade(col, 0.85 + h(90 + k) * 0.25), Math.floor(h(100 + k) * 4));
+    }
+}
+
+const REED: RGB = [0.56, 0.56, 0.30];
+const REED_HEAD: RGB = [0.42, 0.30, 0.18];
+
+/** 芦苇：1~2 丛细长的竖叶，部分叶尖顶着褐色的穗（只是画面，格子仍然可以走） */
+function reedCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, look: Float32Array) {
+    const h = (k: number) => hash2(gx, gz, SEED + 5500 + k);
+    const base = shade(mix(lookLeaf(look), REED, 0.6), TEX_GAIN);
+    const clumps = 1 + Math.floor(h(0) * 2);
+    for (let c = 0; c < clumps; c++) {
+        const cx = x + (h(1 + c) - 0.5) * CELL * 0.7, cz = z + (h(4 + c) - 0.5) * CELL * 0.7;
+        const n = 5 + Math.floor(h(7 + c) * 4);
+        for (let k = 0; k < n; k++) {
+            const q = (i: number) => h(10 + c * 64 + k * 4 + i);
+            const a = q(0) * Math.PI * 2, lean = 0.12 + q(1) * 0.35, ht = 0.9 + q(2) * 0.9;
+            const ex = cx + Math.cos(a) * lean, ey = y + ht, ez = cz + Math.sin(a) * lean;
+            v.leaf.leaf(cx + Math.cos(a) * 0.05, y - 0.05, cz + Math.sin(a) * 0.05, ex, ey, ez, 0.05, 0.03,
+                shade(base, 0.85 + q(3) * 0.3));
+            if (k % 3 === 0) v.base.stud(ex, ey - 0.22, ez, 0.06, REED_HEAD, shade(REED_HEAD, 1.2));
+        }
+    }
+}
+
+/**
+ * 一棵树，按格子哈希从几种造型里选一种（选法见 pickTree；force ≥ 0 时直接用这一种）：
  * 0 松树（树干 + 五层松枝裙摆，下沿由松枝贴图裁成参差的枝梢）；1 阔叶树（主干分出三根枝，四团叶簇）；
  * 2 红叶树（浅色树干分出三根枝，五团红叶）；3 棕榈（两节弯曲的树干 + 七片弧形长叶）。
  * 叶簇画在 leafcard 层、松枝画在 pine 层，树干树枝画在 bark 层（树皮贴图），棕榈的长叶和果子画在 base 层（纯顶点色）。
  * 高度 4~6 米。s 是整体缩放，leaf 是基础叶色，mountain 为 true 时不出棕榈、红叶树用传入的秋色。
  * 棕榈只出现在水边，松树按低频噪声成片分布、大小不一
  */
-function treeCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, s: number, leaf: RGB, mountain = false) {
+function treeCell(v: Veg, gx: number, gz: number, x: number, y: number, z: number, s: number, leaf: RGB, mountain = false,
+    look?: Float32Array, force = -1) {
     const rnd = (k: number) => (i: number) => hash2(gx * 73 + i, gz * 59 + k, SEED + 4300);
     const h = (k: number) => hash2(gx, gz, SEED + 4400 + k);
     const rot = h(1) * Math.PI * 2;
-    // 棕榈只长在水边，大沙滩旁边成片，见 palmChance
-    const palmP = mountain ? 0 : palmChance(x, z);
-    // 松树成片：低频噪声划出松林，松林里绝大多数是松树，松林外只有零星几棵；山上松树本来就多
-    const stand = smoothstep(0.45, 0.6, fbm(x / 45, z / 45, 2, SEED + 4700));
-    const pineP = mountain ? 0.3 + 0.62 * stand : 0.05 + 0.87 * stand;
-    let variant: number;
-    if (h(0) < palmP) variant = 3;
-    else if (h(6) < pineP) variant = 0;
-    else variant = h(7) < 0.66 ? 1 : 2;
+    let variant = force;
+    if (variant < 0) variant = pickTree(x, z, mountain, look, h);
+    if (variant === 4) { deadTree(v, x, y, z, s, rot, h); return; }
+    if (variant === 5) { willowTree(v, x, y, z, s, rot, leaf, h, rnd); return; }
     // 松林里大树小树混在一起：松树的大小差别拉大（约 0.55~1.25 倍）
     if (variant === 0) s *= 0.55 + h(5) * 0.7;
     // 叶子和树干乘贴图，颜色要补偿贴图的平均亮度
@@ -1055,14 +1221,17 @@ function bigStoneAt(ix: number, iz: number, kindG: (gx: number, gz: number) => n
     };
 }
 
-/** 这一带石头的整体高矮（0.6~1.6），几十米一个变化，石林里有高耸的石柱区也有低矮的碎石区 */
+/**
+ * 这一带石头的整体高矮（0.6~1.6），几十米一个变化，石林里有高耸的石柱区也有低矮的碎石区。
+ * 再乘地貌的石头高度倍数（LP.StoneH，乱石林 1.3）
+ */
 function stoneHeightScale(wx: number, wz: number): number {
-    return 0.6 + fbm(wx / 46, wz / 46, 2, SEED + 4900);
+    return (0.6 + fbm(wx / 46, wz / 46, 2, SEED + 4900)) * biomeLook(wx, wz)[LP.StoneH];
 }
 
-/** 这一带的岩性（0 全是花岗岩，1 全是砂岩），大片渐变，灰色和黄色不会一格一格混在一起 */
+/** 这一带的岩性（0 全是花岗岩，1 全是砂岩），大片渐变，灰色和黄色不会一格一格混在一起；加地貌偏移（LP.StrataBias） */
 function stoneZone(wx: number, wz: number): number {
-    return fbm(wx / 34, wz / 34, 2, SEED + 5000);
+    return fbm(wx / 34, wz / 34, 2, SEED + 5000) + biomeLook(wx, wz)[LP.StrataBias];
 }
 
 function drawBigStone(granite: MeshBuilder, strata: MeshBuilder, s: BigStone) {
@@ -1175,7 +1344,8 @@ const WATER_FULL_DEPTH = 2.5;
 
 /**
  * 块 (cx,cz) 的水面网格（世界坐标），只覆盖有顶点低于水位的格子；没有水返回 null。
- * 顶点色 r = 水深 0~1，水面 shader 用它混合深浅颜色和岸边泡沫。
+ * 顶点色 r = 水深 0~1，水面 shader 用它混合深浅颜色和岸边泡沫；
+ * g = 浊水程度（沼泽的黄绿水），b = 冰面程度（北域），都是 0~1，按地貌平滑过渡。
  */
 export function buildWaterMesh(cx: number, cz: number): Laya.Mesh | null {
     const N = CHUNK_CELLS;
@@ -1193,7 +1363,10 @@ export function buildWaterMesh(cx: number, cz: number): Laya.Mesh | null {
         if (vmap[k] < 0) {
             vmap[k] = verts.length / 10;
             const d = Math.max(0, Math.min(1, D[k]));
-            verts.push((gx0 + x) * CELL, WATER_Y, (gz0 + z) * CELL, 0, 1, 0, d, 0, 0, 1);
+            // g = 沼泽浊水程度，b = 冰面程度（按地貌，水面 shader 用它们混色）
+            const wx = (gx0 + x) * CELL, wz = (gz0 + z) * CELL;
+            const L = biomeLook(wx, wz);
+            verts.push(wx, WATER_Y, wz, 0, 1, 0, d, L[LP.Murk], L[LP.Ice], 1);
         }
         return vmap[k];
     };

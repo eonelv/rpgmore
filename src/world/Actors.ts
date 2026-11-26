@@ -100,6 +100,8 @@ const PLAYER_HP = 10;
 /** 多久没挨打开始回血（秒），之后每秒回多少 */
 const REGEN_DELAY = 3;
 const REGEN_RATE = 1;
+/** 主角移动速度（米/秒）。原来是 7，验证区域地貌时临时加快一倍，验证完改回 7 */
+const PLAYER_SPEED = 14;
 
 /** 主角：卡通弓手 */
 export class Player extends Mover {
@@ -115,7 +117,7 @@ export class Player extends Mover {
     constructor(scene: Laya.Scene3D, pos: Vec2, nav: NavGrid) {
         const model = new ArcherModel();
         scene.addChild(model.root);
-        super(model.root, pos, 7, nav);
+        super(model.root, pos, PLAYER_SPEED, nav);
         this.model = model;
         this.lastX = pos.x;
         this.lastZ = pos.z;

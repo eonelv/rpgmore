@@ -40,6 +40,8 @@ GLSL Start
 
     varying vec3 v_PositionWS;
     varying float v_Depth;
+    // x = 沼泽浊水程度，y = 冰面程度（0~1，按地貌）
+    varying vec2 v_Kind;
 
     void main()
     {
@@ -54,14 +56,18 @@ GLSL Start
         // 顶点色 r = 水深 0~1（由 ChunkRenderer.buildWaterMesh 写入）
         // 引擎会把顶点色当作 gamma 空间做 pow(2.2)，这里还原成原始数值
         v_Depth = pow(vertex.vertexColor.r, 1.0 / 2.2);
+        // g = 沼泽浊水程度，b = 冰面程度（同样还原成原始数值）
+        v_Kind = pow(vertex.vertexColor.gb, vec2(1.0 / 2.2));
     #else
         v_Depth = 1.0;
+        v_Kind = vec2(0.0);
     #endif
 
         // 轻微起伏，岸边（深度 0）不动，避免和地形穿插
         float wave1 = sin(positionWS.x * 0.30 + u_Time * 1.1) * cos(positionWS.z * 0.25 + u_Time * 0.9);
         float wave2 = sin(positionWS.x * 0.18 + positionWS.z * 0.22 + u_Time * 0.7) * 0.5;
-        positionWS.y += (wave1 + wave2) * 0.04 * smoothstep(0.0, 0.3, v_Depth);
+        // 冰面不起伏
+        positionWS.y += (wave1 + wave2) * 0.04 * smoothstep(0.0, 0.3, v_Depth) * (1.0 - v_Kind.y);
         v_PositionWS = positionWS;
 
         gl_Position = getPositionCS(positionWS);
@@ -87,6 +93,7 @@ GLSL Start
 
     varying vec3 v_PositionWS;
     varying float v_Depth;
+    varying vec2 v_Kind;
 
     // ---------- 噪声工具 ----------
 
@@ -127,6 +134,8 @@ GLSL Start
     {
         vec2 p = v_PositionWS.xz;
         float depth = clamp(v_Depth, 0.0, 1.0);
+        float murk = clamp(v_Kind.x, 0.0, 1.0);
+        float ice = clamp(v_Kind.y, 0.0, 1.0);
 
         // ---------- 法线（多方向波叠加） ----------
         vec2 g = waveGrad(p, normalize(vec2(1.0, 0.3)),  0.50, 1.4, 0.08)
@@ -135,6 +144,8 @@ GLSL Start
                + waveGrad(p, normalize(vec2(-1.0, -0.2)),2.60, 3.0, 0.015);
         // 浅水区法线扰动减弱，让岸边更平静
         g *= smoothstep(0.0, 0.25, depth);
+        // 冰面几乎没有波纹，浊水波纹弱一些
+        g *= (1.0 - ice * 0.92) * (1.0 - murk * 0.4);
         vec3 n = normalize(vec3(-g.x, 1.0, -g.y));
 
         vec3 viewDir = normalize(u_CameraPos - v_PositionWS);
@@ -143,6 +154,8 @@ GLSL Start
         // 使用更平滑的深度映射，避免跳变
         float depthFactor = smoothstep(0.0, 0.6, depth);
         vec3 base = mix(u_ShallowColor.rgb, u_DeepColor.rgb, depthFactor);
+        // 沼泽：黄绿色的浊水
+        base = mix(base, mix(vec3(0.38, 0.42, 0.20), vec3(0.18, 0.24, 0.12), depthFactor), murk);
 
         // 水下焦散暗纹：给深水区增加一点斑驳的色彩变化
         // 焦散只在有一定深度时可见，浅水区（mask = 0）跳过噪声计算
@@ -157,6 +170,12 @@ GLSL Start
         float fresnel = fv * fv * fv * sqrt(fv);
         // 限制最大反射量，保留水的通透感
         vec3 col = mix(base, u_SkyColor.rgb, fresnel * 0.45 + 0.03);
+        // 北域：冰蓝色的冰面，带一点裂纹状的明暗
+        if (ice > 0.0) {
+            float crack = smoothstep(0.42, 0.5, abs(wNoise(p * 0.35) - wNoise(p * 0.35 + 7.3)));
+            vec3 iceCol = mix(vec3(0.80, 0.90, 0.96), vec3(0.62, 0.78, 0.90), depthFactor) * (1.0 - crack * 0.12);
+            col = mix(col, iceCol, ice);
+        }
 
         // ---------- 太阳高光（稍微收敛） ----------
         vec3 sun = normalize(u_SunDir);
@@ -167,7 +186,7 @@ GLSL Start
         // ---------- 岸边泡沫（多层柔和） ----------
         // 泡沫带最宽 (0.08 + 0.04) * 1.2 = 0.144，更深的地方没有泡沫，跳过噪声计算
         float foam = 0.0;
-        if (depth < 0.15) {
+        if (depth < 0.15 && ice < 0.5) {
             // 两个不同频率的噪声叠加，产生自然碎浪
             float nz1 = wNoise(p * 0.7 + vec2(u_Time * 0.18, u_Time * 0.12));
             float nz2 = wNoise(p * 1.5 + vec2(-u_Time * 0.14, u_Time * 0.22));
@@ -193,6 +212,8 @@ GLSL Start
         alpha = max(alpha, foam * 0.7);
         // 高光区域不透明
         alpha = clamp(alpha + spec * 0.8, 0.0, 1.0);
+        // 浊水、冰面都不透明
+        alpha = mix(alpha, 0.95, max(murk * 0.7, ice));
 
     #ifdef FOG
         col = scenUnlitFog(col);

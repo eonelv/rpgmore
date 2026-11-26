@@ -1,5 +1,6 @@
 import { fbm, hash2, ridgedFbm, valueNoise } from "./Noise";
 import { CELL, CHUNK_CELLS, CHUNK_SIZE, Cell, SEED, isWalkableKind } from "./WorldConfig";
+import { BP, biomeParams } from "./Biome";
 
 /**
  * 程序化世界生成（纯函数，确定性）。
@@ -27,18 +28,57 @@ export const SAND_NOISE = 0.395;
 /** 小水坑被抬到这个噪声值（沙地，略高于水面） */
 const POND_FLOOR = WATER_NOISE + 0.012;
 
+/** 最近一次 terrainNoise 算出的、不含地貌偏移的原始地形噪声（成片石林按它判定，湖区、海区的石林不会消失或暴增） */
+let lastRawNoise = 0;
+
 /**
- * 地形原始噪声 [0,1)。
+ * 地形噪声（大致在 [0,1)，加了地貌偏移后可能略超出），小于 WATER_NOISE 是水。
+ * 原始噪声加上地貌的水面偏移（BP.Water）和细节噪声（BP.Detail）。
  * 只保留大尺度低洼处（前 2 层 octave 的噪声 coarse 足够低）的水；
  * coarse 不够低、只因为细节噪声凹下去形成的小水坑被抬到水面以上（变成沙地），这里也就不会修桥。
- * 按 coarse 平滑过渡，地形高度仍然连续
+ * 沼泽（BP.Pond）保留这些小水坑。按 coarse 和地貌参数平滑过渡，地形高度仍然连续。
+ * 最后挖出河网（BP.River）
  */
 export function terrainNoise(wx: number, wz: number): number {
-    const n = fbm(wx / 140, wz / 140, 4, SEED);
-    if (n >= POND_FLOOR) return n;
-    const coarse = fbm(wx / 140, wz / 140, 2, SEED);   // 只取 n 的低频两层：大尺度的起伏
-    const w = smoothstep(0.28, 0.34, coarse);
-    return n + (POND_FLOOR - n) * w;
+    const p = biomeParams(wx, wz);
+    const off = p[BP.Water], pond = p[BP.Pond], detail = p[BP.Detail], river = p[BP.River];
+    const raw = fbm(wx / 140, wz / 140, 4, SEED);
+    lastRawNoise = raw;
+    let n = raw + off;
+    if (detail > 0) n += detail * (fbm(wx / 35, wz / 35, 2, SEED + 5100) - 0.5) * 2;
+    if (n < POND_FLOOR && pond < 1) {
+        const coarse = fbm(wx / 140, wz / 140, 2, SEED) + off;   // 只取 n 的低频两层：大尺度的起伏
+        const w = smoothstep(0.28, 0.34, coarse) * (1 - pond);
+        n += (POND_FLOOR - n) * w;
+    }
+    if (river > 0) {
+        // 河道：低频噪声 0.5 等值线附近的窄带
+        const d = Math.abs(fbm(wx / 700, wz / 700, 3, SEED + 5300) - 0.5);
+        if (d < RIVER_OUT) n -= river * RIVER_DEPTH * (1 - smoothstep(RIVER_IN, RIVER_OUT, d));
+    }
+    return n;
+}
+
+/** 河道：河网噪声离 0.5 不到 RIVER_IN 的地方压得最低，RIVER_OUT 外不受影响；RIVER_DEPTH 是地形噪声最多压低多少 */
+const RIVER_IN = 0.004;
+const RIVER_OUT = 0.016;
+const RIVER_DEPTH = 0.22;
+
+/** 不含山体的基础地形高度（米）：以水岸（n = WATER_NOISE）为基准，按地貌的起伏倍数缩放，水岸高度不随地貌变 */
+function baseHeight(wx: number, wz: number, n: number): number {
+    const relief = biomeParams(wx, wz)[BP.Relief];
+    return (WATER_NOISE - 0.5) * 14 + (n - WATER_NOISE) * 14 * relief;
+}
+
+/**
+ * 不是石头、树、山、水的地面是沙地还是草地。n 为 terrainNoise 的值。
+ * 水边 [WATER_NOISE, SAND_NOISE + BP.SandBand) 是沙滩；荒原、大漠另有成片的沙地斑块（BP.SandPatch）
+ */
+function isSandGround(wx: number, wz: number, n: number): boolean {
+    const p = biomeParams(wx, wz);
+    if (n < SAND_NOISE + p[BP.SandBand]) return true;
+    const patch = p[BP.SandPatch];
+    return patch > 0 && fbm(wx / 90, wz / 90, 3, SEED + 5200) < patch;
 }
 
 function smoothstep(a: number, b: number, x: number): number {
@@ -55,11 +95,14 @@ const ROAD_KEEP = 0.04;
 
 /** 不考虑道路山谷的山体高度（米），没有山的地方为 0。只用噪声，不会触发道路生成 */
 export function mountainBase(wx: number, wz: number, n: number): number {
-    // 山区分布（低频）；低洼处（湖泊、沙滩）不长山，水体判定保持不变
-    const mask = smoothstep(0.52, 0.64, fbm(wx / 240, wz / 240, 3, SEED + 900)) * smoothstep(0.40, 0.50, n);
+    // 山区分布（低频，加地貌偏移 BP.MtnOff）；低洼处（湖泊、沙滩）不长山，水体判定保持不变
+    const p = biomeParams(wx, wz);
+    const mul = p[BP.MtnMul], off = p[BP.MtnOff];
+    if (mul <= 0) return 0;
+    const mask = smoothstep(0.52, 0.64, fbm(wx / 240, wz / 240, 3, SEED + 900) + off) * smoothstep(0.40, 0.50, n);
     if (mask <= 0) return 0;
     const ridge = ridgedFbm(wx / 110, wz / 110, 5, SEED + 700);
-    return mask * (0.1 + ridge * ridge * 1.1) * MOUNTAIN_HEIGHT;
+    return mask * (0.1 + ridge * ridge * 1.1) * MOUNTAIN_HEIGHT * mul;
 }
 
 /** 山体高度（米），没有山的地方为 0。n 为 terrainNoise 的值 */
@@ -72,7 +115,7 @@ export function mountainHeight(wx: number, wz: number, n: number): number {
 /** 不含山路修整的地形高度（米） */
 function rawHeight(wx: number, wz: number): number {
     const n = terrainNoise(wx, wz);
-    return (n - 0.5) * 14 + mountainHeight(wx, wz, n);
+    return baseHeight(wx, wz, n) + mountainHeight(wx, wz, n);
 }
 
 /**
@@ -107,7 +150,7 @@ interface RoadStyle {
     maxBridge: number;
 }
 
-/** 主干道：路宽约 6~7 格（13 米） */
+/** 主干道：路宽约 6~7 格（13 米）。maxBridge 不用，实际按两端枢纽的地貌取（Hub.maxBridge） */
 const HIGHWAY: RoadStyle = { half: 6.4, valleyIn: 9, valleyOut: 18, maxBridge: 30 };
 /** 小路：路宽约 2 格（4 米） */
 const TRAIL: RoadStyle = { half: 2.2, valleyIn: 4, valleyOut: 10, maxBridge: 6 };
@@ -199,24 +242,35 @@ function cached<T>(map: Map<number, T>, key: number, limit: number, make: () => 
     return v;
 }
 
-const hubCache = new Map<number, P>();
+/**
+ * 大区枢纽。land：是否落在陆地上（水多的地貌所有候选都可能在水里，这时这个枢纽不修主干道）；
+ * maxBridge / peaks：按枢纽处的地貌取的主干道最长桥（米）和修山路的山峰数
+ */
+interface Hub extends P { land: boolean; maxBridge: number; peaks: number; }
+
+/** 找枢纽时最多尝试的候选位置数 */
+const HUB_TRIES = 24;
+
+const hubCache = new Map<number, Hub>();
 /**
  * 大区的枢纽点（主干道交汇处）：在大区中心附近抖动，依次尝试几个候选位置，取第一个在陆地上的。
  * 大区 (0,0) 的第一个候选是出生点附近的固定位置。
  */
-function regionHub(rx: number, rz: number): P {
+function regionHub(rx: number, rz: number): Hub {
     return cached(hubCache, regionKey(rx, rz), 4096, () => {
-        let p: P = { x: rx * REGION, z: rz * REGION };
-        for (let k = 0; k < 8; k++) {
-            p = rx === 0 && rz === 0 && k === 0
-                ? { x: 34, z: 52 }
-                : {
-                    x: (rx + (hash2(rx * 8 + k, rz, SEED + 41) - 0.5) * 0.4) * REGION,
-                    z: (rz + (hash2(rx, rz * 8 + k, SEED + 43) - 0.5) * 0.4) * REGION,
-                };
-            if (terrainNoise(p.x, p.z) > WATER_NOISE + 0.06) break;
+        let x = rx * REGION, z = rz * REGION, land = false;
+        for (let k = 0; k < HUB_TRIES && !land; k++) {
+            if (rx === 0 && rz === 0 && k === 0) { x = 34; z = 52; }
+            else {
+                // 前 8 个候选和改动前的算法一样，后面的换一个种子
+                const s = k < 8 ? 0 : 97;
+                x = (rx + (hash2(rx * 8 + k, rz, SEED + 41 + s) - 0.5) * 0.4) * REGION;
+                z = (rz + (hash2(rx, rz * 8 + k, SEED + 43 + s) - 0.5) * 0.4) * REGION;
+            }
+            land = terrainNoise(x, z) > WATER_NOISE + 0.06;
         }
-        return p;
+        const p = biomeParams(x, z);
+        return { x, z, land, maxBridge: p[BP.Bridge], peaks: Math.round(p[BP.Peaks]) };
     });
 }
 
@@ -228,10 +282,13 @@ const edgeCache = new Map<number, Road | null>();
 function highwayEdge(rx: number, rz: number, dir: 0 | 1): Road | null {
     return cached(edgeCache, regionKey(rx, rz) * 2 + dir, 8192, () => {
         const a = regionHub(rx, rz), b = dir === 0 ? regionHub(rx + 1, rz) : regionHub(rx, rz + 1);
+        if (!a.land || !b.land) return null;
+        // 两端有一端在湖区、海区，就能修长桥
+        const maxBridge = Math.max(a.maxBridge, b.maxBridge);
         const seed = Math.floor(hash2(rx, rz * 2 + dir, SEED + 63) * 1e6);
         for (const bias of DETOURS) {
             const pts = bentLine(a, b, seed, bias, 35);
-            if (firstLongWater(pts, HIGHWAY.maxBridge) === Infinity) return makeRoad(HIGHWAY, pts);
+            if (firstLongWater(pts, maxBridge) === Infinity) return makeRoad(HIGHWAY, pts);
         }
         return null;
     });
@@ -339,7 +396,6 @@ function roadValley(wx: number, wz: number): number {
 
 /** 山体高度超过这个值（米）的山峰修山路 */
 const PEAK_MIN = 14;
-const PEAKS_PER_REGION = 2;
 /** 同一大区两座修路山峰的最小间距（米） */
 const PEAK_SPACING = 200;
 /** 找山峰的采样间距（米） */
@@ -391,7 +447,7 @@ function planMountainTrail(peak: P): number[] | null {
         const x = peak.x + (i % W - R) * MTN_GRID, z = peak.z + (((i / W) | 0) - R) * MTN_GRID;
         const tn = terrainNoise(x, z);
         const m = mountainHeight(x, z, tn);
-        hs[i] = (tn - 0.5) * 14 + m;
+        hs[i] = baseHeight(x, z, tn) + m;
         return type[i] = tn < WATER_NOISE ? 3 : isTrailGoal(x, z, tn, m) ? 2 : 1;
     };
     const dist = new Float32Array(n).fill(Infinity);
@@ -513,8 +569,9 @@ function regionMountainTrails(rx: number, rz: number): number[][] {
         }
         cands.sort((a, b) => b.m - a.m);
         const peaks: P[] = [];
+        const maxPeaks = regionHub(rx, rz).peaks;   // 每个大区的山峰数按枢纽处的地貌取
         for (const c of cands) {
-            if (peaks.length >= PEAKS_PER_REGION) break;
+            if (peaks.length >= maxPeaks) break;
             if (peaks.some(p => Math.hypot(p.x - c.x, p.z - c.z) < PEAK_SPACING)) continue;
             peaks.push(climbToPeak(c.x, c.z));
         }
@@ -670,7 +727,7 @@ export function mountainTrailDistance(wx: number, wz: number): number {
 export function trailGroundKind(wx: number, wz: number): number {
     const n = terrainNoise(wx, wz);
     if (mountainHeight(wx, wz, n) > MOUNTAIN_CELL_MIN) return Cell.Mountain;
-    return n < SAND_NOISE ? Cell.Sand : Cell.Grass;
+    return isSandGround(wx, wz, n) ? Cell.Sand : Cell.Grass;
 }
 
 /** 是否在主干道/小路的路面上（不含山路） */
@@ -719,17 +776,25 @@ export function generateChunk(cx: number, cz: number): ChunkData {
             const gx = gx0 + lx, gz = gz0 + lz;
             const wx = (gx + 0.5) * CELL, wz = (gz + 0.5) * CELL;
             const n = terrainNoise(wx, wz);
+            const raw = lastRawNoise;
             let kind: number = Cell.Grass;
             if (mountainHeight(wx, wz, n) > MOUNTAIN_CELL_MIN) kind = Cell.Mountain;
             else if (n < WATER_NOISE) kind = Cell.Water;
-            else if (n < SAND_NOISE) kind = Cell.Sand;
-            else if (n > 0.66) kind = Cell.Rock;
             else {
-                const forest = fbm(wx / 70, wz / 70, 3, SEED + 500);
-                const r = hash2(gx, gz, SEED + 7);
-                if (forest > 0.56 && r < 0.45) kind = Cell.Tree;
-                else if (r < 0.025) kind = Cell.Rock;   // 零散的石头
-                else if (r < 0.06) kind = Cell.Tree;    // 零散的树
+                // 各阈值按地貌取（biomeParams 返回共享数组，先读出来）
+                const p = biomeParams(wx, wz);
+                const rockTh = p[BP.RockTh], forestTh = p[BP.ForestTh], forestDens = p[BP.ForestDens];
+                const scatterRock = p[BP.ScatterRock], scatterTree = p[BP.ScatterTree];
+                if (n < SAND_NOISE + p[BP.SandBand]) kind = Cell.Sand;
+                else if (raw > rockTh) kind = Cell.Rock;   // 成片的石林（按不含地貌偏移的原始噪声判定）
+                else {
+                    const forest = fbm(wx / 70, wz / 70, 3, SEED + 500);
+                    const r = hash2(gx, gz, SEED + 7);
+                    if (forest > forestTh && r < forestDens) kind = Cell.Tree;
+                    else if (r < scatterRock) kind = Cell.Rock;                // 零散的石头
+                    else if (r < scatterRock + scatterTree) kind = Cell.Tree;  // 零散的树
+                    else if (isSandGround(wx, wz, n)) kind = Cell.Sand;        // 荒原、大漠的沙地斑块
+                }
             }
             for (const r of roads) {
                 if (lineDistance(r, wx, wz, r.style.half) <= r.style.half) {

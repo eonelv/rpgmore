@@ -1,11 +1,11 @@
-import { COLORS } from "../world/ChunkRenderer";
+import { cellColor } from "../world/ChunkRenderer";
 import { Vec2 } from "../world/PathFinder";
 import { SpawnInfo } from "../world/Spawns";
 import { rgbToCss, unitDef } from "../world/UnitDefs";
 import { NavGrid } from "../world/NavGrid";
-import { CHUNK_CELLS, CHUNK_SIZE, Cell, chunkKey } from "../world/WorldConfig";
-import { areaName, isNamedArea } from "../world/Areas";
-import { REGION } from "../world/WorldGen";
+import { CELL, CHUNK_CELLS, CHUNK_SIZE, Cell, chunkKey } from "../world/WorldConfig";
+import { areaKeyAt, isNamedArea, newPlaceInfo, placeAt } from "../world/Areas";
+import { unwarp, warped } from "../world/Biome";
 
 /** 小地图上要画的怪物（只需要位置和种类） */
 export interface MapUnit { pos: Vec2; kind: string; state: string; }
@@ -16,6 +16,7 @@ interface Tile { tex: Laya.Texture; t2d: Laya.Texture2D; }
  * 右上角小地图。
  * - 每个块生成一张 32x32 贴图（1 格 = 1 像素），颜色取自地形配色，缓存起来
  * - 格子被修改（砍树）时只重画那一块
+ * - 区域分界画在贴图里（深色描边）；区域名写在区域露在地图里的那部分的中间，大地图上还写小地名
  * - 叠加：玩家箭头、怪物点、刷怪点范围、路径终点
  * - M 键切换 小地图 / 大地图
  */
@@ -25,6 +26,7 @@ export class Minimap {
     private iconLayer = new Laya.Sprite();
     private tiles = new Map<number, Tile>();
     private pixels = new Uint8Array(CHUNK_CELLS * CHUNK_CELLS * 4);
+    private areaKeys = new Float64Array((CHUNK_CELLS + 2) * (CHUNK_CELLS + 2));
     private big = false;
     private lastKey = "";
 
@@ -77,15 +79,24 @@ export class Minimap {
         if (this.buildBudget <= 0) return null;
         this.buildBudget--;
         const data = this.nav.getChunk(cx, cz);
-        const px = this.pixels, N = CHUNK_CELLS;
+        const px = this.pixels, N = CHUNK_CELLS, M = N + 2;
+        // 每格所在区域（多算一圈），和上下左右任一格不同的格子是分界，画暗一些
+        const keys = this.areaKeys;
+        for (let lz = -1; lz <= N; lz++)
+            for (let lx = -1; lx <= N; lx++)
+                keys[(lz + 1) * M + lx + 1] = areaKeyAt((cx * N + lx + 0.5) * CELL, (cz * N + lz + 0.5) * CELL);
         for (let lz = 0; lz < N; lz++) {
             for (let lx = 0; lx < N; lx++) {
-                const c = COLORS[data.kindLocal(lx, lz)] ?? [1, 0, 1];
+                // 草地、沙地按地貌着色（荒原枯黄、北域雪白……）
+                const c = cellColor(data.kindLocal(lx, lz), (cx * N + lx + 0.5) * CELL, (cz * N + lz + 0.5) * CELL);
                 const water = data.kindLocal(lx, lz) === Cell.Water;
+                const k = (lz + 1) * M + lx + 1, key = keys[k];
+                const edge = keys[k - 1] !== key || keys[k + 1] !== key || keys[k - M] !== key || keys[k + M] !== key;
+                const f = edge ? 0.35 : 1;
                 const i = (lz * N + lx) * 4;
-                px[i] = (water ? 0.22 : c[0]) * 255;
-                px[i + 1] = (water ? 0.45 : c[1]) * 255;
-                px[i + 2] = (water ? 0.78 : c[2]) * 255;
+                px[i] = (water ? 0.22 : c[0]) * 255 * f;
+                px[i + 1] = (water ? 0.45 : c[1]) * 255 * f;
+                px[i + 2] = (water ? 0.78 : c[2]) * 255 * f;
                 px[i + 3] = 255;
             }
         }
@@ -150,17 +161,7 @@ export class Minimap {
             if (x < -r || y < -r || x > S + r || y > S + r) continue;
             g.drawCircle(x, y, r, null, rgbToCss(unitDef(s.kind).color), 1);
         }
-        // 区域名字：写在每个大区露在地图里的那部分的上方（小地图上当前区域的名字因此始终可见）
-        const fs = this.big ? 20 : 14, font = `bold ${fs}px Arial`;
-        for (let rz = Math.round(oz / REGION); rz <= Math.round((oz + this.range) / REGION); rz++) {
-            for (let rx = Math.round(ox / REGION); rx <= Math.round((ox + this.range) / REGION); rx++) {
-                const x0 = Math.max(0, toX((rx - 0.5) * REGION)), x1 = Math.min(S, toX((rx + 0.5) * REGION));
-                const y0 = Math.max(0, toY((rz - 0.5) * REGION)), y1 = Math.min(S, toY((rz + 0.5) * REGION));
-                if (x1 - x0 < fs * 4.5 || y1 - y0 < fs * 2.5) continue;   // 露出来的部分太小，写不下
-                g.fillBorderText(areaName(rx, rz), (x0 + x1) / 2, y0 + (y1 - y0) * 0.28 - fs / 2, font,
-                    isNamedArea(rx, rz) ? "#fff6d8" : "#cfd8e0", "center", 3, "#000000");
-            }
-        }
+        this.drawNames(g, ox, oz, toX, toY);
         const dot = this.big ? 2 : 2.5;
         for (const u of units) {
             const x = toX(u.pos.x), y = toY(u.pos.z);
@@ -180,6 +181,53 @@ export class Minimap {
         ], "#3388ff", "#ffffff", 1.5);
         g.drawRect(0, 0, S, S, null, "#ffffff", 2);
         g.drawLine(S / 2, 3, S / 2, 12, "#ffffff", 1);   // 北 = -Z = 上方
+    }
+
+    private labelInfo = newPlaceInfo();
+
+    /**
+     * 区域名和小地名。在显示范围里每隔一段取样，找出露在地图里的区域和小地名格子：
+     * - 区域名写在区域和显示范围相交部分的中间（小地图上当前区域的名字因此始终可见）；
+     * - 大地图上小地名写在小地名格子的中心（格子中心不在地图里就不写）
+     */
+    private drawNames(g: Laya.Graphics, ox: number, oz: number, toX: (x: number) => number, toY: (z: number) => number) {
+        const S = this.size, R = this.range, big = this.big;
+        const fs = big ? 20 : 14, font = `bold ${fs}px Arial`;
+        const pfs = 13, pfont = `${pfs}px Arial`;
+        const steps = big ? 8 : 3;
+        const areas = new Map<number, { name: string; named: boolean; box: number[]; sx: number; sz: number }>();
+        const places = new Map<number, { name: string; x: number; z: number }>();
+        const p = this.labelInfo;
+        for (let j = 0; j <= steps; j++) {
+            for (let i = 0; i <= steps; i++) {
+                const wx = ox + R * i / steps, wz = oz + R * j / steps;
+                placeAt(wx, wz, p);
+                if (!areas.has(p.area.key)) {
+                    areas.set(p.area.key, { name: p.areaName, named: isNamedArea(p.area), box: [wx, wz, wx, wz], sx: wx, sz: wz });
+                } else {
+                    const b = areas.get(p.area.key)!.box;
+                    b[0] = Math.min(b[0], wx); b[1] = Math.min(b[1], wz); b[2] = Math.max(b[2], wx); b[3] = Math.max(b[3], wz);
+                }
+                if (big && !places.has(p.placeKey)) places.set(p.placeKey, { name: p.placeName, x: p.placeX, z: p.placeZ });
+            }
+        }
+        if (big) {
+            for (const pl of places.values()) {
+                unwarp(pl.x, pl.z);
+                const x = toX(warped.x), y = toY(warped.z);
+                if (x < 30 || y < 10 || x > S - 30 || y > S - 10) continue;
+                g.drawCircle(x, y, 2, "#fff6d8", "#000000", 0.5);
+                g.fillBorderText(pl.name, x, y + 4, pfont, "#e8e0c8", "center", 2, "#000000");
+            }
+        }
+        for (const a of areas.values()) {
+            // 取样点在这个区域里的范围（区域露出来的部分）的中间；那里不属于这个区域（区域是弯的）就用第一个取样点
+            let cx = (a.box[0] + a.box[2]) / 2, cz = (a.box[1] + a.box[3]) / 2;
+            if (areaKeyAt(cx, cz) !== areaKeyAt(a.sx, a.sz)) { cx = a.sx; cz = a.sz; }
+            const x = Math.min(S - fs * 3, Math.max(fs * 3, toX(cx)));
+            const y = Math.min(S - fs * 2, Math.max(fs, toY(cz) - fs * 1.4));
+            g.fillBorderText(a.name, x, y, font, a.named ? "#fff6d8" : "#cfd8e0", "center", 3, "#000000");
+        }
     }
 
     /** 回收远离显示范围的贴图 */
