@@ -28,7 +28,7 @@ const DEBUG_LAYERS: [number, TerrainLayer[], string][] = [
     [Laya.Keyboard.NUMBER_2, ["pine"], "松枝"],
     [Laya.Keyboard.NUMBER_3, ["foliage"], "蕨叶"],
     [Laya.Keyboard.NUMBER_4, ["bark"], "树干"],
-    [Laya.Keyboard.NUMBER_5, ["grass", "sand", "trail"], "草地沙地"],
+    [Laya.Keyboard.NUMBER_5, ["ground"], "地面"],
     [Laya.Keyboard.NUMBER_6, ["granite", "strata", "base"], "石头其他"],
 ];
 /** 射箭时自动瞄准这个距离内最近的怪物（米） */
@@ -80,9 +80,6 @@ export class Main extends Laya.Script {
     private fpsAcc = 0; private fpsFrames = 0; private fps = 0;
 
     async onStart() {
-        // 性能统计面板（排查手机帧率用），放在左上角 HUD 文字下面
-        Laya.Stat.show(10, 130);
-
         // Laya 3 的 Scene3D 不在 2D 场景的子节点里，要通过 scene.scene3D 获取
         const owner = this.owner as Laya.Scene;
         this.scene3D = owner.scene3D;

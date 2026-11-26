@@ -1,9 +1,10 @@
 import { hash2, fbm, valueNoise } from "./Noise";
 import { createWaterMaterial } from "./WaterShader";
 import { MeshBuilder, RGB } from "./MeshBuilder";
+import { GroundBuilder, createGroundMaterial } from "./GroundMesh";
 import {
-    BARK_TILE, FOLIAGE_TILE, GRASS_TILE, GRAVEL_TILE, ROCK_TILE, SAND_TILE, STONE_TILE, TEX_GAIN,
-    barkTexture, foliageTexture, leafCardTexture, pineTexture, graniteTexture, grassTexture, gravelTexture, plankTexture, rockTexture, sandTexture, strataTexture, trailTexture,
+    BARK_TILE, FOLIAGE_TILE, STONE_TILE, TEX_GAIN,
+    barkTexture, foliageTexture, leafCardTexture, pineTexture, graniteTexture, plankTexture, strataTexture,
 } from "./TerrainTextures";
 import { CELL, CHUNK_CELLS, CHUNK_SIZE, Cell, SEED } from "./WorldConfig";
 import { LP, biomeLook } from "./Biome";
@@ -72,8 +73,6 @@ function copyLook(wx: number, wz: number, out = new Float32Array(LOOK_LEN)): Flo
 }
 const LOOK_LEN = biomeLook(0, 0).length;
 
-function lookGrass(L: Float32Array): RGB { return [L[LP.GrassR], L[LP.GrassG], L[LP.GrassB]]; }
-function lookSand(L: Float32Array): RGB { return [L[LP.SandR], L[LP.SandG], L[LP.SandB]]; }
 function lookLeaf(L: Float32Array): RGB { return [L[LP.LeafR], L[LP.LeafG], L[LP.LeafB]]; }
 
 /**
@@ -133,20 +132,16 @@ function shade(c: RGB, f: number): RGB {
 }
 
 /**
- * 地形网格分三层，各用一个材质：
- * - base：纯顶点色（道路、水底、树/石头等物件、桥的栏杆和桥墩）
- * - grass：绿色平地和山上长草的地方，草地贴图 × 顶点色（alpha 测试过渡）
- * - gravel：道路，砂石贴图 × 顶点色
- * - rock：山体，岩石贴图 × 顶点色（山上草地的边缘被裁掉后露出岩石）
- * - sand：沙地，沙地贴图 × 顶点色（alpha 测试过渡）
- * - trail：山路，砂石贴图（alpha 测试裁出路边），按到山路中心线的距离画成连续的带子，盖在草地层上面
+ * 地形网格按材质分层：
+ * - ground：地面（草地、沙地、道路和山路的砂石、山体岩石、水底），一层网格按真实地形高度画，
+ *   地面 shader 在像素里按顶点权重混合几种贴图（见 GroundMesh），没有叠层，不会重合闪烁
+ * - base：纯顶点色（树/石头等物件、桥的栏杆和桥墩）
  * - plank：桥面，木板贴图 × 顶点色
- * - granite / strata：散落的石头（Cell.Rock），花岗岩 / 层状砂岩贴图，法线投影 UV；
- *   石头格子的地面是草地，不再单独铺一层石头底图
+ * - granite / strata：散落的石头（Cell.Rock），花岗岩 / 层状砂岩贴图，法线投影 UV
  * - foliage / bark：蕨丛的单片叶子（树叶贴图）、树干树枝（树皮贴图），法线投影 UV
+ * - leafcard / pine：叶簇面片、松枝（双面裁切）
  */
-export type TerrainLayer = "base" | "grass" | "sand" | "plank" | "rock" | "gravel" | "trail" | "granite" | "strata"
-    | "foliage" | "bark" | "leafcard" | "pine";
+export type TerrainLayer = "ground" | "base" | "plank" | "granite" | "strata" | "foliage" | "bark" | "leafcard" | "pine";
 
 /**
  * 树和灌木用的网格：蕨叶（树叶贴图）、叶簇面片（双面裁切）、松枝（双面裁切）、树干（树皮贴图）、花和果子（纯顶点色）。
@@ -203,34 +198,14 @@ function isPath(kind: number): boolean {
 }
 
 /**
- * 贴图层比下面的地面高一点，避免重合闪烁；草地盖在沙地上面（沙草交界处草的边缘压住沙子）。
- * 间距必须大于深度缓冲的最小可分辨距离：相机 near=0.3、far=1000，16 位深度缓冲在约 25 米处
- * 的精度只有约 0.07 米，0.01 的间距会让两层在深度测试里交替胜出，接触边缘随相机移动闪烁。
- */
-const SAND_LIFT = 0.15;
-const GRASS_LIFT = 0.3;
-/** 山路砂石层盖在草地层上面（间距同样要大于深度精度） */
-const TRAIL_LIFT = 0.42;
-
-/**
- * 山路砂石层的顶点 alpha：路面中心 0.97，路边外 0.55。
- * 贴图 alpha 在 [0.55, 0.85]，像素保留条件 顶点alpha × 贴图alpha ≥ 0.5：
- * 顶点 alpha ≥ 0.91 处全部保留，≤ 0.59 处全部裁掉，中间按贴图噪声裁出参差的边。
+ * 山路砂石的顶点 alpha：路面中心 0.97，路边外 0.55。
+ * 贴图 alpha 在 [0.55, 0.85]，地面 shader 里砂石盖住下面的条件是 顶点alpha × 贴图alpha ≥ 0.5：
+ * 顶点 alpha ≥ 0.91 处全部盖住，≤ 0.59 处全部不盖，中间按贴图噪声出参差的边。
  * 过渡带以路面半宽为中心、宽 1.6 米，所以看到的路宽和可走格子的宽度一致
  */
-const TRAIL_ALPHA_MIN = 0.5 / 0.85;
 function trailAlpha(d: number): number {
     const t = (MOUNTAIN_TRAIL_HALF + 0.8 - d) / 1.6;
     return t <= 0 ? 0 : 0.55 + 0.42 * Math.min(1, t);
-}
-
-/** 草地边缘下面垫的地面颜色（被裁掉的地方露出来的颜色），草地、沙地按地貌取色 */
-function underColor(kind: number, look: Float32Array): RGB {
-    if (kind === Cell.Mountain) return MTN_ROCK;
-    if (kind === Cell.Bridge) return COLORS[Cell.Water];
-    if (kind === Cell.Sand) return lookSand(look);
-    if (kind === Cell.Grass) return lookGrass(look);
-    return COLORS[kind];
 }
 
 /**
@@ -254,7 +229,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
  */
 export function* buildChunkMeshesSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => number,
     far = false): Generator<void, ChunkMesh[], void> {
-    const builders: MeshBuilder[] = [];
+    const builders: Discardable[] = [];
     let finished = false;
     try {
         const out = yield* buildSteps(data, kindGlobal, far, builders);
@@ -265,16 +240,14 @@ export function* buildChunkMeshesSteps(data: ChunkData, kindGlobal: (gx: number,
     }
 }
 
+interface Discardable { discard(): void }
+
 /** buildChunkMeshesSteps 的实际实现；用到的构建器登记到 builders，中途放弃时由调用方清理 */
 function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => number, far: boolean,
-    builders: MeshBuilder[]): Generator<void, ChunkMesh[], void> {
+    builders: Discardable[]): Generator<void, ChunkMesh[], void> {
     const mb = new MeshBuilder();
-    const grass = new MeshBuilder(true);
-    const sand = new MeshBuilder(true);
+    const ground = new GroundBuilder();
     const plank = new MeshBuilder(true);
-    const rock = new MeshBuilder(true);
-    const gravel = new MeshBuilder(true);
-    const trail = new MeshBuilder(true);
     const granite = new MeshBuilder(true, STONE_TILE);
     const strata = new MeshBuilder(true, STONE_TILE);
     const foliage = new MeshBuilder(true, FOLIAGE_TILE);
@@ -282,7 +255,7 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
     const leafcard = new MeshBuilder(true);
     const pine = new MeshBuilder(true);
     const veg: Veg = { leaf: foliage, card: leafcard, pine, bark, base: mb, far };
-    builders.push(mb, grass, sand, plank, rock, gravel, trail, granite, strata, foliage, bark, leafcard, pine);
+    builders.push(mb, ground, plank, granite, strata, foliage, bark, leafcard, pine);
     const gx0 = data.cx * CHUNK_CELLS, gz0 = data.cz * CHUNK_CELLS;
     granite.uvOriginX = strata.uvOriginX = foliage.uvOriginX = bark.uvOriginX = gx0 * CELL;
     granite.uvOriginZ = strata.uvOriginZ = foliage.uvOriginZ = bark.uvOriginZ = gz0 * CELL;
@@ -392,43 +365,88 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
     // SL：顶点处的雪线（米）
     const VGR = new Float32Array(V * V), VGG = new Float32Array(V * V), VGB = new Float32Array(V * V);
     const SL = new Float32Array(V * V);
+    // VS：沙地的顶点颜色 = 地貌沙色 × 周围 4 格的逐格深浅平均
+    const VSR = new Float32Array(V * V), VSG = new Float32Array(V * V), VSB = new Float32Array(V * V);
     for (let z = 0; z <= N; z++) {
         for (let x = 0; x <= N; x++) {
             const L = biomeLook((gx0 + x) * CELL, (gz0 + z) * CELL);
             const flat: RGB = [L[LP.GrassR], L[LP.GrassG], L[LP.GrassB]];
             const mtn: RGB = [flat[0] * MTN_GRASS_RATIO[0], flat[1] * MTN_GRASS_RATIO[1], flat[2] * MTN_GRASS_RATIO[2]];
             SL[z * V + x] = L[LP.SnowLine];
-            let r = 0, g = 0, b = 0;
+            let r = 0, g = 0, b = 0, sf = 0;
             for (let j = -1; j <= 0; j++) {
                 for (let i = -1; i <= 0; i++) {
                     const k = kindAt(x + i, z + j), jt = hash2(gx0 + x + i, gz0 + z + j, SEED + 3);
                     const c = k === Cell.Mountain ? mtn : flat;
                     const f = k === Cell.Mountain ? 0.94 + jt * 0.12 : k === Cell.Rock ? 0.88 + jt * 0.06 : 0.97 + jt * 0.06;
                     r += c[0] * f; g += c[1] * f; b += c[2] * f;
+                    sf += 0.97 + jt * 0.06;
                 }
             }
             const s = TEX_GAIN / 4, vi = z * V + x;
             VGR[vi] = Math.min(1, r * s); VGG[vi] = Math.min(1, g * s); VGB[vi] = Math.min(1, b * s);
+            VSR[vi] = Math.min(1, L[LP.SandR] * sf * s);
+            VSG[vi] = Math.min(1, L[LP.SandG] * sf * s);
+            VSB[vi] = Math.min(1, L[LP.SandB] * sf * s);
         }
     }
-    /**
-     * 平地的贴图层（草地、沙地）的一个格子：4 个顶点 + 2 个三角形，抬高 lift。
-     * 法线按顶点算（地形坡度 GX/GZ），相邻格子在共享的顶点上法线相同，坡上的光照连续过渡，
-     * 看不出一块块的三角面（平面着色时每个三角形一个明暗，山脚的斜坡上特别显眼）。
-     * col 不传时用草地的顶点颜色 VG。对角线和 quad 一样（00-11），不会被下面垫的底色层戳穿
-     */
-    const groundQuad = (mesh: MeshBuilder, lx: number, lz: number, lift: number, tile: number, al: number[], col?: RGB) => {
-        mesh.reserve(4);
-        const vert = (x: number, z: number, a: number) => {
-            const k = z * V + x, sx = GX[k], sz = GZ[k], inv = 1 / Math.hypot(sx, 1, sz);
-            return mesh.addVertex((gx0 + x) * CELL, H[k] + lift, (gz0 + z) * CELL, -sx * inv, inv, -sz * inv,
-                col ? col[0] : VGR[k], col ? col[1] : VGG[k], col ? col[2] : VGB[k], a, x * CELL / tile, z * CELL / tile);
-        };
-        const a = vert(lx, lz, al[0]), b = vert(lx + 1, lz, al[1]), c = vert(lx + 1, lz + 1, al[2]), d = vert(lx, lz + 1, al[3]);
-        mesh.addTri(a, b, c);
-        mesh.addTri(a, c, d);
-    };
 
+    /**
+     * 格子顶点 (x,z) 处的山体岩石颜色：和山体细分网格在同一位置算出的完全一样
+     * （格子顶点在山体边缘时起伏权重是 0，高度、坡度就是 H、GX/GZ），平地和山体在交界处颜色一致
+     */
+    const rockColorAt = (x: number, z: number): RGB => {
+        const k = z * V + x, wx = (gx0 + x) * CELL, wz = (gz0 + z) * CELL;
+        const jit = valueNoise(wx / 3, wz / 3, SEED + 3);
+        const lit = 0.84 + 0.32 * (mountainDetail(wx, wz) * 0.5 + 0.5);
+        return shade(mountainRockColor(H[k], Math.hypot(GX[k], GZ[k]) * 1.2, jit, SL[k]), lit * TEX_GAIN);
+    };
+    const WATER_UNDER = shade(COLORS[Cell.Water], TEX_GAIN);
+    /**
+     * 平地格子顶点的底层（被草地、沙地盖住的地方露出来的那层），按周围 4 格取，优先级：
+     * 道路（砂石）> 山体（岩石）> 水、桥（水底）> 沙地 > 草地。返回颜色，rock 写岩石权重
+     */
+    let underRock = 0;
+    const underAt = (x: number, z: number): RGB => {
+        let road = false, mtn = false, wet = false, sandy = false;
+        for (let j = -1; j <= 0; j++)
+            for (let i = -1; i <= 0; i++) {
+                const k = kindAt(x + i, z + j);
+                if (k === Cell.Road) road = true;
+                else if (k === Cell.Mountain) mtn = true;
+                else if (k === Cell.Water || k === Cell.Bridge) wet = true;
+                else if (isSandGround(k)) sandy = true;
+            }
+        underRock = 0;
+        const vi = z * V + x;
+        if (road) return GRAVEL_COL;
+        if (mtn) { underRock = 1; return rockColorAt(x, z); }
+        if (wet) return WATER_UNDER;
+        if (sandy) return [VSR[vi], VSG[vi], VSB[vi]];
+        return [VGR[vi], VGG[vi], VGB[vi]];
+    };
+    /** 平地格子顶点在地面网格里的下标（相邻格子共用；切分出新 Mesh 后重建） */
+    const coarseIds = new Int32Array(V * V).fill(-1);
+    let coarseEpoch = ground.epoch;
+    const coarseIndex = (x: number, z: number): number => {
+        if (coarseEpoch !== ground.epoch) { coarseIds.fill(-1); coarseEpoch = ground.epoch; }
+        const k = z * V + x;
+        if (coarseIds[k] >= 0) return coarseIds[k];
+        const sx = GX[k], sz = GZ[k], inv = 1 / Math.hypot(sx, 1, sz);
+        const u = underAt(x, z), ta = TA[(z + 1) * RW + x + 1];
+        const id = ground.addVertex((gx0 + x) * CELL, H[k], (gz0 + z) * CELL, -sx * inv, inv, -sz * inv, underRock,
+            VGR[k], VGG[k], VGB[k], AG[k], VSR[k], VSG[k], VSB[k], AS[k], u[0], u[1], u[2], ta, x * CELL, z * CELL);
+        coarseIds[k] = id;
+        return id;
+    };
+    /** 平地格子的地面：4 个顶点 + 2 个三角形，按真实高度 */
+    const flatCell = (lx: number, lz: number) => {
+        ground.reserve(4);
+        const a = coarseIndex(lx, lz), b = coarseIndex(lx + 1, lz);
+        const c = coarseIndex(lx + 1, lz + 1), d = coarseIndex(lx, lz + 1);
+        ground.addTri(a, b, c);
+        ground.addTri(a, c, d);
+    };
     // ---- 山体细分网格 ----
     // 山体格子每边细分成 MTN_SUB 段，顶点带平滑法线和逐顶点颜色，并叠加岩石起伏 mountainDetail，
     // 看不出一格一格的大三角面。
@@ -445,6 +463,8 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
     const FGC = new Float32Array(hasMtn ? FV * FV * 3 : 0);  // 草地层颜色
     const FAG = new Float32Array(hasMtn ? FV * FV : 0);      // 草地层 alpha
     const FTA = new Float32Array(hasMtn ? FV * FV : 0);      // 山路砂石层 alpha
+    const FSC = new Float32Array(hasMtn ? FV * FV * 3 : 0);  // 沙地颜色
+    const FAS = new Float32Array(hasMtn ? FV * FV : 0);      // 沙地 alpha
     if (hasMtn) {
         const roughCell = (lx: number, lz: number) => {
             if (kindAt(lx, lz) !== Cell.Mountain || isTrail(lx, lz)) return false;
@@ -491,6 +511,8 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
                 FRC[k3] = rc[0]; FRC[k3 + 1] = rc[1]; FRC[k3 + 2] = rc[2];
                 // 草地层颜色用格子顶点颜色 VG 的插值：和旁边平地的草地层在共享边上完全一样
                 FGC[k3] = lerp(VGR); FGC[k3 + 1] = lerp(VGG); FGC[k3 + 2] = lerp(VGB);
+                FSC[k3] = lerp(VSR); FSC[k3 + 1] = lerp(VSG); FSC[k3 + 2] = lerp(VSB);
+                FAS[k] = lerp(AS);
             }
         }
     }
@@ -501,59 +523,42 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
         return (FH[k] * (1 - tx) + FH[k + 1] * tx) * (1 - tz) + (FH[k + FV] * (1 - tx) + FH[k + FV + 1] * tx) * tz;
     };
     /**
-     * 细分网格顶点 (i,j) 在 mesh 里的下标，没有就新加一个。相邻的面共用顶点（每个四边形平均只多 1 个顶点）。
-     * layer：0 岩石层、1 草地层、2 山路砂石层。三层用同一份高度（只差抬高量），切分的对角线也一样，
-     * 上面的层不会被下面的层戳穿。
-     * mode 只对岩石层有用，是 UV 的投影面（见 rockUVMode）；同一个顶点在不同投影面下 UV 不同，各存一份
+     * 细分网格顶点 (i,j) 在地面网格里的下标，没有就新加一个。相邻的面共用顶点。
+     * 山体顶点的底层是岩石（岩石权重 1），草地、沙地、山路按各自的 alpha 盖在上面（shader 里合成）
      */
-    const vcache = new Map<MeshBuilder, { ids: Int32Array; epoch: number }>();
-    const mtnIndex = (mesh: MeshBuilder, i: number, j: number, layer: number, mode: number): number => {
-        let c = vcache.get(mesh);
-        if (!c) {
-            c = { ids: new Int32Array(FV * FV * 3).fill(-1), epoch: mesh.epoch };
-            vcache.set(mesh, c);
-        } else if (c.epoch !== mesh.epoch) {
+    const fineIds = new Int32Array(hasMtn ? FV * FV : 0).fill(-1);
+    let fineEpoch = ground.epoch;
+    const mtnIndex = (i: number, j: number): number => {
+        if (fineEpoch !== ground.epoch) {
             // 顶点满了切分出了新的 Mesh，之前的下标作废
-            c.ids.fill(-1);
-            c.epoch = mesh.epoch;
+            fineIds.fill(-1);
+            fineEpoch = ground.epoch;
         }
-        const k = j * FV + i, k3 = k * 3, key = k3 + mode;
-        if (c.ids[key] >= 0) return c.ids[key];
+        const k = j * FV + i, k3 = k * 3;
+        if (fineIds[k] >= 0) return fineIds[k];
         const lx = i * MTN_STEP, lz = j * MTN_STEP;
-        const px = gx0 * CELL + lx, pz = gz0 * CELL + lz;
-        const h = FH[k], nx = FNR[k3], ny = FNR[k3 + 1], nz = FNR[k3 + 2];
-        let id: number;
-        if (layer === 1) {
-            id = mesh.addVertex(px, h + GRASS_LIFT, pz, nx, ny, nz, FGC[k3], FGC[k3 + 1], FGC[k3 + 2], FAG[k],
-                lx / GRASS_TILE, lz / GRASS_TILE);
-        } else if (layer === 2) {
-            id = mesh.addVertex(px, h + TRAIL_LIFT, pz, nx, ny, nz, GRAVEL_COL[0], GRAVEL_COL[1], GRAVEL_COL[2], FTA[k],
-                lx / GRAVEL_TILE, lz / GRAVEL_TILE);
-        } else {
-            // 缓坡投影 (x,z)；朝 ±x 的陡坡投影 (z,y)；朝 ±z 的陡坡投影 (x,y)
-            const u = mode === 1 ? lz : lx, v = mode === 0 ? lz : h;
-            id = mesh.addVertex(px, h, pz, nx, ny, nz, FRC[k3], FRC[k3 + 1], FRC[k3 + 2], 1, u / ROCK_TILE, v / ROCK_TILE);
-        }
-        c.ids[key] = id;
+        const id = ground.addVertex(gx0 * CELL + lx, FH[k], gz0 * CELL + lz, FNR[k3], FNR[k3 + 1], FNR[k3 + 2], 1,
+            FGC[k3], FGC[k3 + 1], FGC[k3 + 2], FAG[k], FSC[k3], FSC[k3 + 1], FSC[k3 + 2], FAS[k],
+            FRC[k3], FRC[k3 + 1], FRC[k3 + 2], FTA[k], lx, lz);
+        fineIds[k] = id;
         return id;
     };
-    /** 画一个山体格子的某一层（细分成 MTN_SUB × MTN_SUB 个平滑四边形） */
-    const mountainCell = (mesh: MeshBuilder, lx: number, lz: number, layer: number) => {
+    /** 画一个山体格子（细分成 MTN_SUB × MTN_SUB 个平滑四边形） */
+    const mountainCell = (lx: number, lz: number) => {
         for (let sj = 0; sj < MTN_SUB; sj++) {
             for (let si = 0; si < MTN_SUB; si++) {
                 const i = lx * MTN_SUB + si, j = lz * MTN_SUB + sj;
                 const k = j * FV + i;
                 const ha = FH[k], hb = FH[k + 1], hc = FH[k + FV + 1], hd = FH[k + FV];
-                const mode = layer === 0 ? rockUVMode(MTN_STEP, ha, hb, hc, hd) : 0;
                 // 四个顶点必须和之前共用的顶点在同一个 Mesh 里
-                mesh.reserve(4);
-                const a = mtnIndex(mesh, i, j, layer, mode), b = mtnIndex(mesh, i + 1, j, layer, mode);
-                const c = mtnIndex(mesh, i + 1, j + 1, layer, mode), d = mtnIndex(mesh, i, j + 1, layer, mode);
+                ground.reserve(4);
+                const a = mtnIndex(i, j), b = mtnIndex(i + 1, j);
+                const c = mtnIndex(i + 1, j + 1), d = mtnIndex(i, j + 1);
                 // 沿高度差较小的对角线切开，山脊、山沟的走向不会被三角形切成锯齿
                 if (Math.abs(ha - hc) <= Math.abs(hb - hd)) {
-                    mesh.addTri(a, b, c); mesh.addTri(a, c, d);
+                    ground.addTri(a, b, c); ground.addTri(a, c, d);
                 } else {
-                    mesh.addTri(a, b, d); mesh.addTri(b, c, d);
+                    ground.addTri(a, b, d); ground.addTri(b, c, d);
                 }
             }
         }
@@ -568,10 +573,6 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
             const x0 = gx * CELL, x1 = x0 + CELL, z0 = gz * CELL, z1 = z0 + CELL;
             const i00 = lz * V + lx, i10 = i00 + 1, i01 = i00 + V, i11 = i01 + 1;
             const h00 = H[i00], h10 = H[i10], h01 = H[i01], h11 = H[i11];
-            const gal = [AG[i00], AG[i10], AG[i11], AG[i01]];   // 草地 alpha：与 quad 的顶点顺序 a-b-c-d 一致
-            const gMin = Math.min(gal[0], gal[1], gal[2], gal[3]), gMax = Math.max(gal[0], gal[1], gal[2], gal[3]);
-            const sal = [AS[i00], AS[i10], AS[i11], AS[i01]];   // 沙地 alpha
-            const sMin = Math.min(sal[0], sal[1], sal[2], sal[3]), sMax = Math.max(sal[0], sal[1], sal[2], sal[3]);
             const jitter = hash2(gx, gz, SEED + 3);
             const hAvg = (h00 + h10 + h01 + h11) / 4;
             const slope = (Math.max(h00, h10, h01, h11) - Math.min(h00, h10, h01, h11)) / CELL;
@@ -579,67 +580,12 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
             // 格子中心的地貌外观（拷贝一份，下面会多次用到）
             const look = copyLook(cxw, czw, cellLook);
             const snowLine = look[LP.SnowLine];
-            let col: RGB;
-            if (kind === Cell.Mountain) {
-                col = shade(mountainRockColor(hAvg, slope, jitter, snowLine), (0.94 + jitter * 0.12) * TEX_GAIN);
-            } else if (isGrassGround(kind)) {
-                // 石头格子的地面也是草地（石头长在草里），颜色用草地的，稍暗一点像被石头挡住了光
-                col = shade(lookGrass(look), (kind === Cell.Rock ? 0.88 + jitter * 0.06 : 0.97 + jitter * 0.06) * TEX_GAIN);
-            } else if (isSandGround(kind)) {
-                col = shade(lookSand(look), (0.97 + jitter * 0.06) * TEX_GAIN);
-            } else {
-                col = shade(COLORS[kind], 0.92 + jitter * 0.16);
-            }
-            const ref = [cxw, -1000, czw];   // 参考点在下方 => 法线朝上
-            const grassCell = isGrassGround(kind), sandCell = isSandGround(kind);
-            const textured = grassCell || sandCell;
-            // base 层：非贴图格子总是画；贴图格子只在边缘（有裁剪）时画，做底色
-            if (kind === Cell.Mountain) {
-                // 岩石层；四个顶点都被草完全盖住的格子不用画
-                if (gMin < 1) mountainCell(rock, lx, lz, 0);
-            } else if (kind === Cell.Road) {
-                gravelQuad(gravel, lx, lz, x0, z0, h00, h10, h11, h01, ref);
-            } else if (!textured) {
-                mb.quad([x0, h00, z0], [x1, h10, z0], [x1, h11, z1], [x0, h01, z1], col, ref);
-            } else {
-                const aMin2 = grassCell ? gMin : sMin;
-                if (aMin2 < 1) {
-                    let nk = -1;
-                    for (const [dx, dz] of NEIGHBORS8) {
-                        const k = kindAt(lx + dx, lz + dz);
-                        if (k >= 0 && (grassCell ? !isGrassGround(k) : !isSandGround(k))) { nk = k; break; }
-                    }
-                    // 挨着路的草地边缘下面垫砂石，被裁掉的地方和路面是同一种材质
-                    if (nk === Cell.Road) gravelQuad(gravel, lx, lz, x0, z0, h00, h10, h11, h01, ref);
-                    else if (nk >= 0) mb.quad([x0, h00, z0], [x1, h10, z0], [x1, h11, z1], [x0, h01, z1],
-                        shade(underColor(nk, look), 0.92 + jitter * 0.16), ref);
-                }
-            }
-            // 草地层
-            if (kind === Cell.Mountain) {
-                if (gMax > 0.5) mountainCell(grass, lx, lz, 1);
-            } else if (grassCell || gMax > 0.5) {
-                // UV 用块内坐标（块边长是 GRASS_TILE 的整数倍，块之间无缝），避免远处 UV 过大损失精度
-                groundQuad(grass, lx, lz, GRASS_LIFT, GRASS_TILE, gal);
-            }
-            // 山路砂石层：盖在草地层上面，边缘由顶点 alpha × 贴图 alpha 裁出参差的路边
+            // 地面：一层网格，按真实高度
+            if (kind === Cell.Mountain) mountainCell(lx, lz);
+            else flatCell(lx, lz);
+            // tMax > 0 表示格子挨着山路
             const t00 = (lz + 1) * RW + lx + 1;
-            const tal = [TA[t00], TA[t00 + 1], TA[t00 + RW + 1], TA[t00 + RW]];
-            const tMax = Math.max(tal[0], tal[1], tal[2], tal[3]);
-            if (tMax > TRAIL_ALPHA_MIN && kind === Cell.Mountain) {
-                mountainCell(trail, lx, lz, 2);
-            } else if (tMax > TRAIL_ALPHA_MIN) {
-                const u0 = lx * CELL / GRAVEL_TILE, u1 = u0 + CELL / GRAVEL_TILE;
-                const v0 = lz * CELL / GRAVEL_TILE, v1 = v0 + CELL / GRAVEL_TILE;
-                const L = TRAIL_LIFT;
-                trail.quad([x0, h00 + L, z0], [x1, h10 + L, z0], [x1, h11 + L, z1], [x0, h01 + L, z1], GRAVEL_COL, ref,
-                    [u0, v0, u1, v0, u1, v1, u0, v1], tal);
-            }
-            // 沙地层
-            if (sandCell || sMax > 0.5) {
-                const scol = sandCell ? col : shade(lookSand(look), (0.97 + jitter * 0.06) * TEX_GAIN);
-                groundQuad(sand, lx, lz, SAND_LIFT, SAND_TILE, sal, scol);
-            }
+            const tMax = Math.max(TA[t00], TA[t00 + 1], TA[t00 + RW + 1], TA[t00 + RW]);
 
             const baseY = Math.max(Math.min(h00, h10, h01, h11), WALK_MIN_Y - 0.3);
             const r = hash2(gx, gz, SEED + 99);
@@ -734,12 +680,8 @@ function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => nu
     }
     const out: ChunkMesh[] = [];
     for (const m of mb.build()) out.push({ mesh: m, layer: "base" });
-    for (const m of grass.build()) out.push({ mesh: m, layer: "grass" });
-    for (const m of sand.build()) out.push({ mesh: m, layer: "sand" });
+    for (const m of ground.build()) out.push({ mesh: m, layer: "ground" });
     for (const m of plank.build()) out.push({ mesh: m, layer: "plank" });
-    for (const m of rock.build()) out.push({ mesh: m, layer: "rock" });
-    for (const m of gravel.build()) out.push({ mesh: m, layer: "gravel" });
-    for (const m of trail.build()) out.push({ mesh: m, layer: "trail" });
     for (const m of granite.build()) out.push({ mesh: m, layer: "granite" });
     for (const m of strata.build()) out.push({ mesh: m, layer: "strata" });
     for (const m of foliage.build()) out.push({ mesh: m, layer: "foliage" });
@@ -1265,29 +1207,6 @@ function pebbles(granite: MeshBuilder, strata: MeshBuilder, gx: number, gz: numb
 
 /** 砂石路面：所有格子同一个颜色（不做逐格明暗，否则会拼成棋盘格），深浅变化交给贴图 */
 const GRAVEL_COL = shade(COLORS[Cell.Road], TEX_GAIN);
-function gravelQuad(gravel: MeshBuilder, lx: number, lz: number, x0: number, z0: number,
-    h00: number, h10: number, h11: number, h01: number, ref: number[]) {
-    const x1 = x0 + CELL, z1 = z0 + CELL;
-    // 块内坐标做 UV，块边长是 GRAVEL_TILE 的整数倍，块之间无缝
-    const u0 = lx * CELL / GRAVEL_TILE, u1 = u0 + CELL / GRAVEL_TILE;
-    const v0 = lz * CELL / GRAVEL_TILE, v1 = v0 + CELL / GRAVEL_TILE;
-    gravel.quad([x0, h00, z0], [x1, h10, z0], [x1, h11, z1], [x0, h01, z1], GRAVEL_COL, ref,
-        [u0, v0, u1, v0, u1, v1, u0, v1]);
-}
-
-/**
- * 山体岩石面的 UV 投影面（顶点顺序 00-10-11-01，size 是边长，米）。按面的朝向选：
- * 0 缓坡，从上往下投影 (x,z)；1 朝 ±x 的陡坡，投影到 (z, 高度)；2 朝 ±z 的陡坡，投影到 (x, 高度)。
- * 陡坡投影到侧面，悬崖上的纹理不会被拉长，岩层是横向的。
- * 水平坐标用块内坐标（块边长是 ROCK_TILE 的整数倍，块之间无缝）
- */
-function rockUVMode(size: number, h00: number, h10: number, h11: number, h01: number): number {
-    const dhx = Math.abs((h10 + h11) - (h00 + h01)) / (2 * size);
-    const dhz = Math.abs((h01 + h11) - (h00 + h10)) / (2 * size);
-    if (Math.max(dhx, dhz) < 0.8) return 0;
-    return dhx > dhz ? 1 : 2;
-}
-
 /** 桥面顶部高度 = 可走高度，角色正好站在桥面上 */
 const DECK_Y = WALK_MIN_Y;
 const DECK_THICK = 0.22;
@@ -1385,7 +1304,7 @@ export function buildWaterMesh(cx: number, cz: number): Laya.Mesh | null {
 }
 
 export interface WorldMaterials {
-    terrain: Record<TerrainLayer, Laya.BlinnPhongMaterial>;
+    terrain: Record<TerrainLayer, Laya.Material>;
     water: Laya.Material;
 }
 
@@ -1395,16 +1314,6 @@ function terrainMaterial(tex: Laya.BaseTexture | null): Laya.BlinnPhongMaterial 
     m.albedoColor = new Laya.Color(1, 1, 1, 1);
     m.specularColor = new Laya.Color(0, 0, 0, 1);
     if (tex) m.albedoTexture = tex;
-    m.lock = true;
-    return m;
-}
-
-/** 草地/沙地材质：alpha 测试，顶点 alpha × 贴图 alpha < 0.5 的像素被裁掉 */
-function cutoutMaterial(tex: Laya.BaseTexture): Laya.BlinnPhongMaterial {
-    const m = terrainMaterial(tex);
-    m.lock = false;
-    m.materialRenderMode = Laya.MaterialRenderMode.RENDERMODE_CUTOUT;
-    m.alphaTestValue = 0.5;
     m.lock = true;
     return m;
 }
@@ -1428,12 +1337,8 @@ export function createWorldMaterials(): WorldMaterials {
     return {
         terrain: {
             base: terrainMaterial(null),
-            grass: cutoutMaterial(grassTexture()),
-            sand: cutoutMaterial(sandTexture()),
+            ground: createGroundMaterial(GRAVEL_COL),
             plank: terrainMaterial(plankTexture()),
-            rock: terrainMaterial(rockTexture()),
-            gravel: terrainMaterial(gravelTexture()),
-            trail: cutoutMaterial(trailTexture()),
             granite: terrainMaterial(graniteTexture()),
             strata: terrainMaterial(strataTexture()),
             foliage: terrainMaterial(foliageTexture()),

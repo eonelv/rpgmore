@@ -6,9 +6,6 @@ import {
 
 /** 是否显示水面（排查手机帧率时临时关闭，改回 true 恢复） */
 const DRAW_WATER = true;
-/** 是否显示 alpha 测试的地面层（草地/沙地/山路），排查手机帧率用 */
-const DRAW_CUTOUT = true;
-const CUTOUT_LAYERS = new Set<TerrainLayer>(["grass", "sand", "trail"]);
 /** 玩家每走这么远（米）重新检查一次哪些块要加载、卸载、切换精度 */
 const REFRESH_STEP = 4;
 
@@ -68,7 +65,7 @@ export class ChunkManager {
     private lastZ = NaN;
     private px = 0;
     private pz = 0;
-    private terrainMat: Record<TerrainLayer, Laya.BlinnPhongMaterial>;
+    private terrainMat: Record<TerrainLayer, Laya.Material>;
     private waterMat: Laya.Material;
 
     /** 块加载/卸载的回调，用于生成/回收怪物 */
@@ -251,11 +248,7 @@ export class ChunkManager {
     }
 
     private attachTerrain(c: LoadedChunk, all: ChunkMesh[]) {
-        const parts = all.filter(p => {
-            if (DRAW_CUTOUT || !CUTOUT_LAYERS.has(p.layer)) return true;
-            p.mesh.destroy();
-            return false;
-        });
+        const parts = all;
         c.meshes = parts.map(p => p.mesh);
         c.layers = parts.map(p => p.layer);
         c.terrain = parts.map(p => {

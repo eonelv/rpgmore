@@ -67,7 +67,21 @@ const RIVER_DEPTH = 0.22;
 /** 不含山体的基础地形高度（米）：以水岸（n = WATER_NOISE）为基准，按地貌的起伏倍数缩放，水岸高度不随地貌变 */
 function baseHeight(wx: number, wz: number, n: number): number {
     const relief = biomeParams(wx, wz)[BP.Relief];
-    return (WATER_NOISE - 0.5) * 14 + (n - WATER_NOISE) * 14 * relief;
+    return (WATER_NOISE - 0.5) * 14 + (n - WATER_NOISE) * 14 * relief + rollingHills(wx, wz, n, relief);
+}
+
+/** 缓坡的最大高度（米，乘地貌的起伏倍数） */
+const HILL_HEIGHT = 5;
+/**
+ * 陆地上弧线起伏的大土坡（米）：波长约 70 米的低频噪声，坡顶圆、坡脚缓。
+ * 只抬高不压低；离水岸近（沙滩一带）逐渐压平，水岸线、桥头和水面不受影响。
+ * 格子类型按 terrainNoise 判定，和高度无关，所以不会改变哪里是水、沙地、草地
+ */
+function rollingHills(wx: number, wz: number, n: number, relief: number): number {
+    const land = smoothstep(SAND_NOISE, SAND_NOISE + 0.06, n);
+    if (land <= 0) return 0;
+    const f = fbm(wx / 70, wz / 70, 2, SEED + 5400);
+    return smoothstep(0.3, 0.75, f) * HILL_HEIGHT * relief * land;
 }
 
 /**
