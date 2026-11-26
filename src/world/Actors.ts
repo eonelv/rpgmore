@@ -95,8 +95,17 @@ const ATTACK_FIRE = 0.28;
 const ATTACK_HOLD = 0.42;
 const ATTACK_TIME = 0.6;
 
+/** 主角的血量；被石头砸中扣 1 点，最少剩 1 点（打不死） */
+const PLAYER_HP = 10;
+/** 多久没挨打开始回血（秒），之后每秒回多少 */
+const REGEN_DELAY = 3;
+const REGEN_RATE = 1;
+
 /** 主角：卡通弓手 */
 export class Player extends Mover {
+    readonly maxHp = PLAYER_HP;
+    hp = PLAYER_HP;
+    private sinceHurt = 0;
     private model: ArcherModel;
     /** 射箭动作进行到第几秒；< 0 = 没在射箭 */
     private atkT = -1;
@@ -118,6 +127,15 @@ export class Player extends Mover {
     /** 正在拉弓（箭还没射出去）：这段时间站在原地不能移动 */
     get drawing() { return this.atkT >= 0 && this.atkT < ATTACK_FIRE; }
 
+    /** 被砸中：扣血但不会死 */
+    hurt(damage: number) {
+        this.hp = Math.max(1, this.hp - damage);
+        this.sinceHurt = 0;
+    }
+
+    /** 身体中心的高度（石头的命中判定用） */
+    get centerY() { return groundY(this.pos.x, this.pos.z) + 0.8; }
+
     startAttack() {
         if (this.atkT < 0) this.atkT = 0;
     }
@@ -127,6 +145,9 @@ export class Player extends Mover {
         const moving = Math.abs(this.pos.x - this.lastX) + Math.abs(this.pos.z - this.lastZ) > 1e-4;
         this.lastX = this.pos.x;
         this.lastZ = this.pos.z;
+
+        this.sinceHurt += dt;
+        if (this.sinceHurt >= REGEN_DELAY && this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + REGEN_RATE * dt);
 
         let aim = 0, draw = 0, nocked = false, fired = false;
         if (this.atkT >= 0) {
@@ -159,6 +180,8 @@ type MonsterState = "idle" | "wander" | "chase";
 
 /** 挨打后抖动的时长（秒） */
 const HIT_SHAKE = 0.18;
+/** 扔石头前的蓄力时长（秒）：身体往下压再弹起，提示玩家该躲了 */
+const THROW_WINDUP = 0.4;
 
 /** 所有怪物共用的网格，避免每只怪物各建一份 */
 let shared: { body: Laya.Mesh; eye: Laya.Mesh; eyeMat: Laya.Material } | null = null;
@@ -186,6 +209,10 @@ export class Monster extends Mover {
     /** 挨打后的抖动倒计时 */
     private hitTimer = 0;
     private hitScale = new Laya.Vector3(1, 1, 1);
+    /** 扔石头的冷却倒计时 */
+    private throwCd: number;
+    /** 扔石头的蓄力进度（秒）；< 0 = 没在蓄力 */
+    private windup = -1;
 
     constructor(scene: Laya.Scene3D, pos: Vec2, nav: NavGrid, readonly kind: string, readonly def: UnitDef,
         private matIdle: Laya.Material, private matChase: Laya.Material,
@@ -210,7 +237,11 @@ export class Monster extends Mover {
         this.body = body;
         this.hp = def.hp;
         this.thinkTimer = Math.random() * 2;
+        this.throwCd = def.throwCd * (0.5 + Math.random() * 0.5);
     }
+
+    /** 扔出石头的位置（头顶上方） */
+    get throwY() { return groundY(this.pos.x, this.pos.z) + 1.15 * this.def.size + 0.2; }
 
     /** 身体中心的高度（箭瞄准和命中判定用） */
     get centerY() { return groundY(this.pos.x, this.pos.z) + 0.5 * this.def.size; }
@@ -223,16 +254,13 @@ export class Monster extends Mover {
         return this.hp <= 0;
     }
 
-    update(dt: number, player: Vec2, paths: PathService) {
-        if (this.hitTimer > 0) {
-            this.hitTimer = Math.max(0, this.hitTimer - dt);
-            const s = 1 + 0.35 * this.hitTimer / HIT_SHAKE;
-            this.hitScale.setValue(s, 2 - s, s);
-            this.node.transform.localScale = this.hitScale;
-        }
-
+    /** 每帧更新；返回 true = 这一帧扔出一块石头 */
+    update(dt: number, player: Vec2, paths: PathService): boolean {
         const dx = player.x - this.pos.x, dz = player.z - this.pos.z;
         const distToPlayer = Math.sqrt(dx * dx + dz * dz);
+        const threw = this.updateThrow(dt, distToPlayer);
+        if (this.windup >= 0) this.heading = Math.atan2(dx, dz);   // 蓄力时转向玩家
+        this.updateScale(dt);
 
         // 状态切换
         if (this.state !== "chase" && distToPlayer < this.def.aggro) this.setState("chase");
@@ -256,7 +284,49 @@ export class Monster extends Mover {
             this.state = "wander";
             this.goTo({ x: this.home.x + Math.cos(a) * r, z: this.home.z + Math.sin(a) * r }, paths);
         }
-        if (this.advance(dt) && this.state === "wander") this.state = "idle";
+        // 蓄力扔石头时站住不动
+        if (this.windup >= 0) this.syncNode();
+        else if (this.advance(dt) && this.state === "wander") this.state = "idle";
+        return threw;
+    }
+
+    /** 追击时冷却好了、玩家在射程内就开始蓄力，蓄力结束扔出去 */
+    private updateThrow(dt: number, dist: number): boolean {
+        if (this.windup >= 0) {
+            this.windup += dt;
+            if (this.windup < THROW_WINDUP) return false;
+            this.windup = -1;
+            this.throwCd = this.def.throwCd * (0.8 + Math.random() * 0.4);
+            return this.state === "chase";
+        }
+        this.throwCd -= dt;
+        if (this.throwCd <= 0 && this.state === "chase" && dist <= this.def.throwRange) this.windup = 0;
+        return false;
+    }
+
+    /** 挨打的抖动 + 蓄力时往下压、扔出前弹起 */
+    private updateScale(dt: number) {
+        if (this.hitTimer <= 0 && this.windup < 0) {
+            if (this.hitScale.x !== 1 || this.hitScale.y !== 1) {
+                this.hitScale.setValue(1, 1, 1);
+                this.node.transform.localScale = this.hitScale;
+            }
+            return;
+        }
+        let sx = 1, sy = 1;
+        if (this.hitTimer > 0) {
+            this.hitTimer = Math.max(0, this.hitTimer - dt);
+            const k = 0.35 * this.hitTimer / HIT_SHAKE;
+            sx += k; sy -= k;
+        }
+        if (this.windup >= 0) {
+            const t = this.windup / THROW_WINDUP;
+            // 前 75% 慢慢压扁，最后 25% 猛地拉长
+            const k = t < 0.75 ? -0.25 * (t / 0.75) : -0.25 + 0.5 * ((t - 0.75) / 0.25);
+            sx -= k * 0.6; sy += k;
+        }
+        this.hitScale.setValue(sx, sy, sx);
+        this.node.transform.localScale = this.hitScale;
     }
 
     private goTo(target: Vec2, paths: PathService) {
@@ -340,8 +410,11 @@ export class MonsterManager {
         }
     }
 
+    /** 怪物扔出石头时调用：from 是怪物，石头落向扔出时玩家的位置 */
+    onThrow: ((m: Monster) => void) | null = null;
+
     update(dt: number, player: Vec2) {
-        for (const m of this.monsters) m.update(dt, player, this.paths);
+        for (const m of this.monsters) if (m.update(dt, player, this.paths)) this.onThrow?.(m);
     }
 
     /** 已击杀的怪物数 */

@@ -46,14 +46,19 @@ function toByte(v: number): number {
 export type RGB = [number, number, number];
 const ZERO_UV = [0, 0, 0, 0, 0, 0];
 const ONE_ALPHA = [1, 1, 1];
+const ZERO_UV8 = [0, 0, 0, 0, 0, 0, 0, 0];
+const ONE_ALPHA4 = [1, 1, 1, 1];
 
 function shadeTop(c: RGB): RGB {
     return [Math.min(1, c[0] * 1.12), Math.min(1, c[1] * 1.12), Math.min(1, c[2] * 1.12)];
 }
 
 export class MeshBuilder {
-    private verts: number[] = [];
-    private idx: number[] = [];
+    /** 顶点数据和索引用可增长的类型化数组（比 number[] + push 快，构建树多的块时 GC 也少），切分 Mesh 后复用 */
+    private verts = new Float32Array(4096);
+    private vlen = 0;
+    private idx = new Uint16Array(4096);
+    private ilen = 0;
     private count = 0;
     private meshes: Laya.Mesh[] = [];
 
@@ -84,7 +89,6 @@ export class MeshBuilder {
         const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
         nx /= len; ny /= len; nz /= len;
         const mx = (ax + bx + cx) / 3 - rx, my = (ay + by + cy) / 3 - ry, mz = (az + bz + cz) / 3 - rz;
-        const v = this.verts;
         const t = this.withUV;
         const u = uv ?? (t && this.uvTile > 0 ? this.projectUV(ax, ay, az, bx, by, bz, cx, cy, cz, nx, ny, nz) : ZERO_UV);
         const a = al ?? ONE_ALPHA;
@@ -92,17 +96,45 @@ export class MeshBuilder {
         // 绕序反了会被背面剔除：只能看到物体背面的内壁，地面整个消失
         if (nx * mx + ny * my + nz * mz < 0) {
             nx = -nx; ny = -ny; nz = -nz;
-            v.push(ax, ay, az, nx, ny, nz, col[0], col[1], col[2], a[0]); if (t) v.push(u[0], u[1]);
-            v.push(bx, by, bz, nx, ny, nz, col[0], col[1], col[2], a[1]); if (t) v.push(u[2], u[3]);
-            v.push(cx, cy, cz, nx, ny, nz, col[0], col[1], col[2], a[2]); if (t) v.push(u[4], u[5]);
+            this.put(ax, ay, az, nx, ny, nz, col[0], col[1], col[2], a[0], u[0], u[1]);
+            this.put(bx, by, bz, nx, ny, nz, col[0], col[1], col[2], a[1], u[2], u[3]);
+            this.put(cx, cy, cz, nx, ny, nz, col[0], col[1], col[2], a[2], u[4], u[5]);
         } else {
-            v.push(ax, ay, az, nx, ny, nz, col[0], col[1], col[2], a[0]); if (t) v.push(u[0], u[1]);
-            v.push(cx, cy, cz, nx, ny, nz, col[0], col[1], col[2], a[2]); if (t) v.push(u[4], u[5]);
-            v.push(bx, by, bz, nx, ny, nz, col[0], col[1], col[2], a[1]); if (t) v.push(u[2], u[3]);
+            this.put(ax, ay, az, nx, ny, nz, col[0], col[1], col[2], a[0], u[0], u[1]);
+            this.put(cx, cy, cz, nx, ny, nz, col[0], col[1], col[2], a[2], u[4], u[5]);
+            this.put(bx, by, bz, nx, ny, nz, col[0], col[1], col[2], a[1], u[2], u[3]);
         }
         const n0 = this.count;
-        this.idx.push(n0, n0 + 1, n0 + 2);
+        this.tri3(n0, n0 + 1, n0 + 2);
         this.count += 3;
+    }
+
+    /** 写一个顶点（withUV 时带 u、v，否则忽略） */
+    private put(x: number, y: number, z: number, nx: number, ny: number, nz: number,
+        r: number, g: number, b: number, a: number, u: number, v: number) {
+        const fpv = this.withUV ? 12 : 10;
+        if (this.vlen + fpv > this.verts.length) {
+            const nv = new Float32Array(this.verts.length * 2);
+            nv.set(this.verts);
+            this.verts = nv;
+        }
+        const o = this.verts, i = this.vlen;
+        o[i] = x; o[i + 1] = y; o[i + 2] = z; o[i + 3] = nx; o[i + 4] = ny; o[i + 5] = nz;
+        o[i + 6] = r; o[i + 7] = g; o[i + 8] = b; o[i + 9] = a;
+        if (fpv === 12) { o[i + 10] = u; o[i + 11] = v; }
+        this.vlen = i + fpv;
+    }
+
+    /** 写一个三角形的三个顶点下标 */
+    private tri3(a: number, b: number, c: number) {
+        if (this.ilen + 3 > this.idx.length) {
+            const ni = new Uint16Array(this.idx.length * 2);
+            ni.set(this.idx);
+            this.idx = ni;
+        }
+        const o = this.idx, i = this.ilen;
+        o[i] = a; o[i + 1] = b; o[i + 2] = c;
+        this.ilen = i + 3;
     }
 
     /** 按法线主方向把三角形投影到 xz / zy / xy 平面得到 UV（三个顶点同一个投影面，三角形内没有接缝） */
@@ -119,10 +151,54 @@ export class MeshBuilder {
 
     /** 四边形 a-b-c-d（按顺序围成一圈）；uv = [ua, va, ub, vb, uc, vc, ud, vd]；al = 四个顶点的 alpha */
     quad(a: number[], b: number[], c: number[], d: number[], col: RGB, ref: number[], uv?: number[], al?: number[]) {
+        // 平的四边形（树干、松枝、盒子的面）：两个三角形共用 4 个顶点，比各用 3 个省三分之一的顶点。
+        // 不平的（起伏的地面）仍拆成两个各自带法线的三角形，平面着色的效果不变
+        const n1 = this.faceNormal(a, b, c), n2 = this.faceNormal(a, c, d);
+        if (n1 && n2 && n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] > 0.9999) {
+            let quv = uv;
+            if (!quv && this.withUV && this.uvTile > 0) {
+                // 自动投影 UV 只看法线方向，两个三角形同一个投影面，4 个顶点的 UV 一致
+                const p = this.projectUV(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], n1[0], n1[1], n1[2]);
+                const q = this.projectUV(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], n1[0], n1[1], n1[2]);
+                quv = [p[0], p[1], p[2], p[3], p[4], p[5], q[4], q[5]];
+            }
+            this.flatQuad(a, b, c, d, n1, col, ref, quv, al);
+            return;
+        }
         this.tri(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], col, ref[0], ref[1], ref[2],
             uv && [uv[0], uv[1], uv[2], uv[3], uv[4], uv[5]], al && [al[0], al[1], al[2]]);
         this.tri(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], col, ref[0], ref[1], ref[2],
             uv && [uv[0], uv[1], uv[4], uv[5], uv[6], uv[7]], al && [al[0], al[2], al[3]]);
+    }
+
+    /** 三角形 a-b-c 的单位法线（右手定则），退化的三角形返回 null */
+    private faceNormal(a: number[], b: number[], c: number[]): number[] | null {
+        const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+        const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+        const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+        return len > 1e-9 ? [nx / len, ny / len, nz / len] : null;
+    }
+
+    /** 平的四边形：4 个顶点、2 个三角形（对角线 a-c，和 quad 拆成两个三角形时一样），法线背离参考点 */
+    private flatQuad(a: number[], b: number[], c: number[], d: number[], n: number[], col: RGB, ref: number[],
+        uv?: number[], al?: number[]) {
+        if (this.count + 4 > MAX_VERTS) this.flush();
+        let nx = n[0], ny = n[1], nz = n[2];
+        const mx = (a[0] + c[0]) / 2 - ref[0], my = (a[1] + c[1]) / 2 - ref[1], mz = (a[2] + c[2]) / 2 - ref[2];
+        const u = uv ?? ZERO_UV8, A = al ?? ONE_ALPHA4;
+        // 和 tri 的规则一致：从法线方向看过去为顺时针
+        const outward = nx * mx + ny * my + nz * mz >= 0;
+        if (!outward) { nx = -nx; ny = -ny; nz = -nz; }
+        const n0 = this.count;
+        const P = [a, b, c, d];
+        for (let i = 0; i < 4; i++) {
+            const p = P[i];
+            this.put(p[0], p[1], p[2], nx, ny, nz, col[0], col[1], col[2], A[i], u[i * 2], u[i * 2 + 1]);
+        }
+        if (outward) { this.tri3(n0, n0 + 2, n0 + 1); this.tri3(n0, n0 + 3, n0 + 2); }
+        else { this.tri3(n0, n0 + 1, n0 + 2); this.tri3(n0, n0 + 2, n0 + 3); }
+        this.count += 4;
     }
 
     /**
@@ -139,14 +215,13 @@ export class MeshBuilder {
     /** 添加一个顶点，返回它的下标（只在 epoch 不变时有效） */
     addVertex(x: number, y: number, z: number, nx: number, ny: number, nz: number,
         r: number, g: number, b: number, a: number, u = 0, v = 0): number {
-        this.verts.push(x, y, z, nx, ny, nz, r, g, b, a);
-        if (this.withUV) this.verts.push(u, v);
+        this.put(x, y, z, nx, ny, nz, r, g, b, a, u, v);
         return this.count++;
     }
 
     /** 用三个顶点下标添加三角形；从正面看过去是顺时针（地面：从上往下看顺时针） */
     addTri(a: number, b: number, c: number) {
-        this.idx.push(a, b, c);
+        this.tri3(a, b, c);
     }
 
     /** 小凸起（花、果子）：底面边长 s 的四棱锥，不画底面，4 个三角形；两个面用 col、两个面用 topCol */
@@ -323,7 +398,7 @@ export class MeshBuilder {
             N[o] /= len; N[o + 1] /= len; N[o + 2] /= len;
         }
 
-        const out = this.verts, wUV = this.withUV;
+        const wUV = this.withUV;
         for (let t = 0; t < T.length; t += 3) {
             if (this.count + 3 > MAX_VERTS) this.flush();
             const ia = T[t], ib = T[t + 1], ic = T[t + 2];
@@ -334,8 +409,7 @@ export class MeshBuilder {
                 ? this.projectUV(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], fx, fy, fz) : ZERO_UV;
             const put = (i: number, k: number) => {
                 const p = P[i], col2 = C[i], o = i * 3;
-                out.push(p[0], p[1], p[2], N[o], N[o + 1], N[o + 2], col2[0], col2[1], col2[2], 1);
-                if (wUV) out.push(uv[k * 2], uv[k * 2 + 1]);
+                this.put(p[0], p[1], p[2], N[o], N[o + 1], N[o + 2], col2[0], col2[1], col2[2], 1, uv[k * 2], uv[k * 2 + 1]);
             };
             // 绕序：从法线方向看过去为顺时针（和 tri 一致）。a-b-c 的叉积朝外时要交换 b、c
             const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
@@ -344,7 +418,7 @@ export class MeshBuilder {
             if (dot < 0) { put(ia, 0); put(ib, 1); put(ic, 2); }
             else { put(ia, 0); put(ic, 2); put(ib, 1); }
             const n0 = this.count;
-            this.idx.push(n0, n0 + 1, n0 + 2);
+            this.tri3(n0, n0 + 1, n0 + 2);
             this.count += 3;
         }
     }
@@ -489,16 +563,15 @@ export class MeshBuilder {
     card(p: number[], u: number[], v: number[], half: number, n: number[], col: RGB, cell: number) {
         if (this.count + 4 > MAX_VERTS) this.flush();
         const u0 = (cell & 1) * 0.5 + 0.004, v0 = ((cell >> 1) & 1) * 0.5 + 0.004, d = 0.492;
-        const out = this.verts;
-        const vert = (su: number, sv: number) => {
-            out.push(p[0] + (u[0] * su + v[0] * sv) * half, p[1] + (u[1] * su + v[1] * sv) * half,
-                p[2] + (u[2] * su + v[2] * sv) * half, n[0], n[1], n[2], col[0], col[1], col[2], 1);
-            if (this.withUV) out.push(u0 + (su + 1) * 0.5 * d, v0 + (sv + 1) * 0.5 * d);
-        };
+        const vert = (su: number, sv: number) =>
+            this.put(p[0] + (u[0] * su + v[0] * sv) * half, p[1] + (u[1] * su + v[1] * sv) * half,
+                p[2] + (u[2] * su + v[2] * sv) * half, n[0], n[1], n[2], col[0], col[1], col[2], 1,
+                u0 + (su + 1) * 0.5 * d, v0 + (sv + 1) * 0.5 * d);
         // 四个角共用顶点：4 个顶点 + 6 个索引
         vert(-1, -1); vert(1, -1); vert(1, 1); vert(-1, 1);
         const n0 = this.count;
-        this.idx.push(n0, n0 + 1, n0 + 2, n0, n0 + 2, n0 + 3);
+        this.tri3(n0, n0 + 1, n0 + 2);
+        this.tri3(n0, n0 + 2, n0 + 3);
         this.count += 4;
     }
 
@@ -528,11 +601,22 @@ export class MeshBuilder {
             vertices = f32;
         } else {
             decl = Laya.VertexMesh.getVertexDeclaration(t ? "POSITION,NORMAL,COLOR,UV" : "POSITION,NORMAL,COLOR");
-            vertices = new Float32Array(src);
+            vertices = src.slice(0, this.vlen);
         }
-        this.meshes.push(Laya.PrimitiveMesh._createMesh(decl, vertices, new Uint16Array(this.idx)));
-        this.verts = [];
-        this.idx = [];
+        this.meshes.push(Laya.PrimitiveMesh._createMesh(decl, vertices, this.idx.slice(0, this.ilen)));
+        // 缓冲区留给下一个 Mesh 复用
+        this.vlen = 0;
+        this.ilen = 0;
+        this.count = 0;
+        this.epoch++;
+    }
+
+    /** 放弃构建：销毁已经切分出来的 Mesh，清空缓冲区 */
+    discard() {
+        for (const mesh of this.meshes) mesh.destroy();
+        this.meshes = [];
+        this.vlen = 0;
+        this.ilen = 0;
         this.count = 0;
         this.epoch++;
     }

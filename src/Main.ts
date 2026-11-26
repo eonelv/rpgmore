@@ -1,9 +1,11 @@
 import { SpawnPoint } from "./editor/SpawnPoint";
 import { AreaBanner } from "./ui/AreaBanner";
 import { Minimap } from "./ui/Minimap";
+import { TouchControls } from "./ui/TouchControls";
 import { Monster, MonsterManager, Player } from "./world/Actors";
-import { ArrowManager } from "./world/Projectiles";
+import { ArrowManager, ParticlePool, RockManager } from "./world/Projectiles";
 import { ChunkManager } from "./world/ChunkManager";
+import { TerrainLayer } from "./world/ChunkRenderer";
 import { NavGrid } from "./world/NavGrid";
 import { PathService, Vec2 } from "./world/PathFinder";
 import { SpawnRegistry } from "./world/Spawns";
@@ -15,6 +17,19 @@ const { regClass } = Laya;
 
 /** 是否绘制寻路线（排查手机帧率时临时关闭） */
 const DRAW_PATHS = false;
+/**
+ * 排查帧率用的开关：屏幕左下角一排按钮（手机上点按钮，电脑上也可以按数字键 1~6、0），
+ * 开关各个渲染层和 MSAA，看帧率能不能回来，就知道是哪一部分拖慢了渲染。改成 false 去掉
+ */
+const DEBUG_RENDER_KEYS = true;
+const DEBUG_LAYERS: [number, TerrainLayer[], string][] = [
+    [Laya.Keyboard.NUMBER_1, ["leafcard"], "叶簇面片"],
+    [Laya.Keyboard.NUMBER_2, ["pine"], "松枝"],
+    [Laya.Keyboard.NUMBER_3, ["foliage"], "蕨叶"],
+    [Laya.Keyboard.NUMBER_4, ["bark"], "树干"],
+    [Laya.Keyboard.NUMBER_5, ["grass", "sand", "trail"], "草地沙地"],
+    [Laya.Keyboard.NUMBER_6, ["granite", "strata", "base"], "石头其他"],
+];
 /** 射箭时自动瞄准这个距离内最近的怪物（米） */
 const ATTACK_RANGE = 26;
 
@@ -24,6 +39,7 @@ const ATTACK_RANGE = 26;
  *      J / 空格 射箭（按住连射，自动瞄准附近最近的怪物）；
  *      G 键自动前往 1~2 公里外的随机地点（测试长距离分段寻路和流式加载）；H 键沿山路去最近的山顶（在山顶再按去下一座）；
  *      M 键切换小地图/大地图。
+ * 手机：左手边摇杆移动，其他区域拖动旋转镜头、双指缩放、轻点同鼠标左键；右下角攻击 / 砍树 / 去山顶 / 去远方按钮。
  * 刷怪点：在场景里任意位置放挂了 SpawnPoint 组件的节点，启动时自动收集。
  */
 @regClass()
@@ -35,6 +51,10 @@ export class Main extends Laya.Script {
     private chunks: ChunkManager;
     private monsters: MonsterManager;
     private arrows: ArrowManager;
+    private rocks: RockManager;
+    private particles: ParticlePool;
+    /** 被石头砸中时的全屏红色闪光 */
+    private hurtFlash: Laya.Sprite;
     private player: Player;
     private lines: Laya.PixelLineSprite3D;
     private marker: Laya.MeshSprite3D;
@@ -44,6 +64,11 @@ export class Main extends Laya.Script {
     private banner: AreaBanner;
 
     private camDist = 26;
+    /** 镜头绕角色的水平角（弧度）：0 = 镜头在角色的 +Z 方向，朝 -Z 看 */
+    private camYaw = 0;
+    /** 镜头俯仰角（弧度），默认约 48.6°，和原来固定镜头的角度一样 */
+    private camPitch = Math.atan2(0.85, 0.75);
+    private touch: TouchControls | null = null;
     private ray = new Laya.Ray(new Laya.Vector3(), new Laya.Vector3());
     private v2 = new Laya.Vector2();
     private camPos = new Laya.Vector3();
@@ -75,8 +100,9 @@ export class Main extends Laya.Script {
         this.camera.clearFlag = Laya.CameraClearFlags.SolidColor;
         this.camera.clearColor = fog;
         this.camera.farPlane = 200;
-        // 多重采样抗锯齿：不开的话模型边缘和小细节是一格格的锯齿（手机上掉帧明显可以关掉）
-        this.camera.msaa = true;
+        // 多重采样抗锯齿：不开的话模型边缘和小细节是一格格的锯齿。
+        // 手机上关掉：多一个全屏的多重采样缓冲和一次解析，叶子的 alpha 裁切在多重采样下也更费
+        this.camera.msaa = !Laya.Browser.onMobile;
 
         // 水面 shader 是资源文件，要先加载，否则水面材质会退回默认 shader
         await loadWaterShader();
@@ -86,7 +112,13 @@ export class Main extends Laya.Script {
         this.chunks = new ChunkManager(worldRoot, this.nav);
         this.collectSpawnPoints(this.scene3D);
         this.monsters = new MonsterManager(this.scene3D, this.nav, this.paths, this.spawns);
-        this.arrows = new ArrowManager(this.scene3D, this.nav, this.monsters);
+        this.particles = new ParticlePool(this.scene3D, this.camera);
+        this.arrows = new ArrowManager(this.scene3D, this.nav, this.monsters, this.particles);
+        this.rocks = new RockManager(this.scene3D, this.nav, this.particles);
+        this.monsters.onThrow = m => {
+            const p = this.player;
+            this.rocks.throw(m.pos.x, m.throwY, m.pos.z, p.pos.x, p.centerY, p.pos.z);
+        };
         this.minimap = new Minimap(this.nav, this.spawns.all);
         this.banner = new AreaBanner();
         this.chunks.onChunkLoaded = (cx, cz) => this.monsters.spawnForChunk(cx, cz);
@@ -115,24 +147,59 @@ export class Main extends Laya.Script {
         this.hud.pos(10, 10);
         Laya.stage.addChild(this.hud);
 
-        Laya.stage.on(Laya.Event.MOUSE_DOWN, this, this.onClick);
+        this.hurtFlash = new Laya.Sprite();
+        this.hurtFlash.mouseEnabled = false;
+        this.hurtFlash.alpha = 0;
+        Laya.stage.addChild(this.hurtFlash);
+
+        if (Laya.Browser.onMobile) this.createTouchControls();
+        else Laya.stage.on(Laya.Event.MOUSE_DOWN, this, () => this.onClick(Laya.stage.mouseX, Laya.stage.mouseY));
         Laya.stage.on(Laya.Event.MOUSE_WHEEL, this, (e: Laya.Event) => {
-            // 最近可以拉到 3.5 米，角色占大半个屏幕，能看清脸和服装细节
-            this.camDist = Math.min(60, Math.max(3.5, this.camDist - e.delta * 0.02 * this.camDist));
+            this.zoom(1 - e.delta * 0.02);
         });
         Laya.stage.on(Laya.Event.KEY_DOWN, this, (e: Laya.Event) => {
             if (e.keyCode === Laya.Keyboard.G) this.travelFar();
             if (e.keyCode === Laya.Keyboard.H) this.climbNearestPeak();
             if (e.keyCode === Laya.Keyboard.M) this.minimap.toggle();
+            if (DEBUG_RENDER_KEYS) this.debugRenderKey(e.keyCode);
         });
+        if (DEBUG_RENDER_KEYS) this.createDebugPanel();
         this.ready = true;
     }
 
     onDestroy() {
         Laya.stage.offAllCaller(this);
         this.hud?.destroy();
+        this.hurtFlash?.destroy();
         this.minimap?.destroy();
         this.banner?.destroy();
+        this.debugPanel?.destroy(true);
+        this.touch?.destroy();
+    }
+
+    /** 镜头距离乘 k（< 1 拉近）。最近可以拉到 3.5 米，角色占大半个屏幕，能看清脸和服装细节 */
+    private zoom(k: number) {
+        this.camDist = Math.min(60, Math.max(3.5, this.camDist * k));
+    }
+
+    /** 手机上的摇杆、镜头手势和右下角按钮 */
+    private createTouchControls() {
+        // 左下角留出排查帧率按钮的高度，摇杆停在它上面
+        const t = new TouchControls(
+            (x, y) => !!this.debugPanel && this.debugPanel.hitTestPoint(x, y),
+            DEBUG_RENDER_KEYS ? 54 : 0);
+        t.onTap = (x, y) => this.onClick(x, y);
+        t.onRotate = (dx, dy) => {
+            // 拖动一个屏幕短边约转半圈；往右拖 = 景物跟着手指往右转
+            this.camYaw -= dx * Math.PI;
+            this.camPitch = Math.min(1.35, Math.max(0.25, this.camPitch + dy * Math.PI * 0.6));
+        };
+        t.onPinch = ratio => this.zoom(1 / ratio);
+        t.onPress = id => {
+            if (id === "far") this.travelFar();
+            else if (id === "peak") this.climbNearestPeak();
+        };
+        this.touch = t;
     }
 
     /** 收集场景里所有 SpawnPoint 组件（任意层级），转成运行时数据 */
@@ -157,6 +224,17 @@ export class Main extends Laya.Script {
         if (I.hasKeyDown(K.S) || I.hasKeyDown(K.DOWN)) mz += 1;
         if (I.hasKeyDown(K.A) || I.hasKeyDown(K.LEFT)) mx -= 1;
         if (I.hasKeyDown(K.D) || I.hasKeyDown(K.RIGHT)) mx += 1;
+        // 摇杆：推的幅度决定速度（键盘一直是全速）
+        let speedK = 1;
+        if (this.touch && (this.touch.moveX || this.touch.moveZ)) {
+            mx = this.touch.moveX; mz = this.touch.moveZ;
+            speedK = Math.min(1, Math.hypot(mx, mz));
+        }
+        // 方向相对镜头：往上推 = 朝镜头看的方向走
+        if (mx || mz) {
+            const c = Math.cos(this.camYaw), s = Math.sin(this.camYaw);
+            [mx, mz] = [mx * c + mz * s, -mx * s + mz * c];
+        }
         // 拉弓的一瞬间站定，箭射出去之后才能继续走
         if (p.drawing) {
             // 不移动
@@ -164,7 +242,8 @@ export class Main extends Laya.Script {
             this.chopTarget = null;
             if (p.path.length || p.pending) { p.cancelPath(); p.finalTarget = null; this.marker.active = false; }
             const len = Math.sqrt(mx * mx + mz * mz);
-            p.moveFree(mx / len * p.speed * dt, mz / len * p.speed * dt);
+            const step = p.speed * speedK * dt / len;
+            p.moveFree(mx * step, mz * step);
         } else if (p.advance(dt)) {
             // 分段路径走完一段后，继续规划下一段
             if (p.partial && p.finalTarget && !p.pending) this.requestPlayerPath(p.finalTarget);
@@ -172,13 +251,18 @@ export class Main extends Laya.Script {
         }
 
         this.updateChop(dt);
-        if (I.hasKeyDown(K.F)) this.chopNearby();   // 按住 F 连续砍
-        if (I.hasKeyDown(K.J) || I.hasKeyDown(K.SPACE)) this.attack();   // 按住 J / 空格 连续射箭
+        const tc = this.touch;
+        if (I.hasKeyDown(K.F) || tc?.held("chop")) this.chopNearby();   // 按住 F / 砍树按钮 连续砍
+        if (I.hasKeyDown(K.J) || I.hasKeyDown(K.SPACE) || tc?.held("attack")) this.attack();   // 按住 J / 空格 / 攻击按钮 连续射箭
 
         this.paths.update();
         this.monsters.update(dt, p.pos);
         if (p.animate(dt)) this.releaseArrow();
         this.arrows.update(dt);
+        const hits = this.rocks.update(dt, p.pos.x, p.centerY, p.pos.z);
+        if (hits > 0) { p.hurt(hits); this.flashHurt(); }
+        this.particles.update(dt);
+        this.updateHurtFlash(dt);
         this.chunks.update(p.pos.x, p.pos.z);
         this.updateCamera(dt);
         // 性能测试：屏蔽寻路线绘制（DRAW_PATHS 改回 true 恢复）
@@ -188,11 +272,14 @@ export class Main extends Laya.Script {
         this.updateHud(dt);
     }
 
-    private onClick() {
+    /** 鼠标左键 / 手机轻点：(x, y) 是舞台坐标 */
+    private onClick(x: number, y: number) {
+        // 点在排查帧率的按钮上：不寻路
+        if (this.debugPanel && this.debugPanel.hitTestPoint(x, y)) return;
         // 点在小地图/大地图上：寻路到对应的世界位置（不再穿透到地面）
-        const mapHit = this.minimap.pick(Laya.stage.mouseX, Laya.stage.mouseY);
+        const mapHit = this.minimap.pick(x, y);
         if (mapHit) { this.walkTo(mapHit); return; }
-        const hit = this.pickGround(Laya.stage.mouseX, Laya.stage.mouseY);
+        const hit = this.pickGround(x, y);
         if (!hit) return;
         const gx = Math.floor(hit.x / CELL), gz = Math.floor(hit.z / CELL);
         if (chopResult(this.nav.kind(gx, gz)) !== null) this.walkToChop(gx, gz);
@@ -236,6 +323,19 @@ export class Main extends Laya.Script {
             this.arrows.fire(this.muzzle, tx, groundY(tx, tz) + 1, tz, null);
         }
         this.atkTarget = null;
+    }
+
+    /** 被砸中：屏幕泛红一下 */
+    private flashHurt() {
+        const f = this.hurtFlash;
+        f.graphics.clear();
+        f.graphics.drawRect(0, 0, Laya.stage.width, Laya.stage.height, "#c01010");
+        f.alpha = 0.35;
+    }
+
+    private updateHurtFlash(dt: number) {
+        const f = this.hurtFlash;
+        if (f.alpha > 0) f.alpha = Math.max(0, f.alpha - dt * 1.4);
     }
 
     // ---------------- 砍树 ----------------
@@ -377,13 +477,16 @@ export class Main extends Laya.Script {
         const p = this.player.pos;
         const py = groundY(p.x, p.z);
         const k = 1 - Math.exp(-dt * 8);
-        const tx = p.x, tz = p.z + this.camDist * 0.75;
+        // 镜头到角色的距离和原来固定镜头一样（水平 0.75、竖直 0.85 倍 camDist），按 yaw / pitch 绕角色转
+        const r = this.camDist * Math.hypot(0.75, 0.85);
+        const horiz = r * Math.cos(this.camPitch);
+        const tx = p.x + Math.sin(this.camYaw) * horiz, tz = p.z + Math.cos(this.camYaw) * horiz;
         // 视线被山挡住时抬高相机：沿 角色->相机 采样，保证视线高出地面至少 1.5 米
         const eye = py + 1;
-        let ty = py + this.camDist * 0.85;
+        let ty = py + r * Math.sin(this.camPitch);
         for (let i = 1; i <= 12; i++) {
             const t = i / 12;
-            const h = groundY(p.x, p.z + (tz - p.z) * t) + 1.5;
+            const h = groundY(p.x + (tx - p.x) * t, p.z + (tz - p.z) * t) + 1.5;
             ty = Math.max(ty, eye + (h - eye) / t);
         }
         const c = this.camera.transform.position;
@@ -416,16 +519,78 @@ export class Main extends Laya.Script {
         }
     }
 
+    // ---------------- 排查帧率 ----------------
+
+    private debugPanel: Laya.Sprite | null = null;
+    private debugButtons: { text: Laya.Text; on: () => boolean }[] = [];
+
+    /** 屏幕左下角一排开关按钮：亮绿 = 正在画，灰 = 已关闭 */
+    private createDebugPanel() {
+        const panel = new Laya.Sprite();
+        const W = 96, H = 44, GAP = 8;
+        const items: { name: string; toggle: () => void; on: () => boolean }[] = DEBUG_LAYERS.map(([, layers, name]) => ({
+            name,
+            toggle: () => {
+                const hide = !this.chunks.isLayerHidden(layers[0]);
+                for (const l of layers) this.chunks.setLayerHidden(l, hide);
+            },
+            on: () => !this.chunks.isLayerHidden(layers[0]),
+        }));
+        items.push({ name: "MSAA", toggle: () => { this.camera.msaa = !this.camera.msaa; }, on: () => this.camera.msaa });
+        items.forEach((it, i) => {
+            const t = new Laya.Text();
+            t.text = it.name;
+            t.fontSize = 18;
+            t.color = "#ffffff";
+            t.width = W; t.height = H;
+            t.align = "center"; t.valign = "middle";
+            t.pos(i * (W + GAP), 0);
+            t.mouseEnabled = true;
+            t.on(Laya.Event.MOUSE_DOWN, this, (e: Laya.Event) => {
+                e.stopPropagation();
+                it.toggle();
+                this.refreshDebugPanel();
+            });
+            panel.addChild(t);
+            this.debugButtons.push({ text: t, on: it.on });
+        });
+        panel.size(items.length * (W + GAP) - GAP, H);
+        panel.mouseEnabled = true;
+        Laya.stage.addChild(panel);
+        const place = () => panel.pos(10, Laya.stage.height - H - 10);
+        place();
+        Laya.stage.on(Laya.Event.RESIZE, this, place);
+        this.debugPanel = panel;
+        this.refreshDebugPanel();
+    }
+
+    private refreshDebugPanel() {
+        for (const b of this.debugButtons) b.text.bgColor = b.on() ? "#2e8b3a" : "#555555";
+    }
+
+    /** 电脑上：数字键 1~6 开关渲染层，0 开关 MSAA */
+    private debugRenderKey(code: number) {
+        if (code === Laya.Keyboard.NUMBER_0) this.camera.msaa = !this.camera.msaa;
+        for (const [key, layers] of DEBUG_LAYERS) {
+            if (code !== key) continue;
+            const hide = !this.chunks.isLayerHidden(layers[0]);
+            for (const l of layers) this.chunks.setLayerHidden(l, hide);
+        }
+        this.refreshDebugPanel();
+    }
+
     private updateHud(dt: number) {
         this.fpsAcc += dt; this.fpsFrames++;
         if (this.fpsAcc >= 0.5) { this.fps = Math.round(this.fpsFrames / this.fpsAcc); this.fpsAcc = 0; this.fpsFrames = 0; }
         const p = this.player.pos;
         this.hud.text =
-            `FPS ${this.fps}\n` +
+            `FPS ${this.fps}   生命 ${Math.ceil(this.player.hp)}/${this.player.maxHp}\n` +
             `${this.banner.area}  位置 (${p.x.toFixed(0)}, ${p.z.toFixed(0)})  块 (${Math.floor(p.x / CHUNK_SIZE)}, ${Math.floor(p.z / CHUNK_SIZE)})\n` +
             `已加载块 ${this.chunks.loadedCount}  排队 ${this.chunks.queuedCount}  寻路数据缓存 ${this.nav.cachedCount}  已砍 ${this.chopCount}  地图修改 ${this.nav.editCount}\n` +
-            `刷怪点 ${this.spawns.all.length}  怪物 ${this.monsters.monsters.length}  追击 ${this.monsters.chasingCount}  击杀 ${this.monsters.kills}  箭 ${this.arrows.count}  粒子 ${this.arrows.particleCount}  寻路排队 ${this.paths.pending}  寻路耗时 ${this.paths.lastFrameMs.toFixed(1)}ms\n` +
-            `左键点地面/地图: 自动寻路   左键点树: 走过去砍掉   F(按住): 砍面前的树   J / 空格(按住): 射箭
-WASD: 移动   滚轮: 缩放   G: 前往远方   H: 去最近的山顶   M: 大地图`;
+            `刷怪点 ${this.spawns.all.length}  怪物 ${this.monsters.monsters.length}  追击 ${this.monsters.chasingCount}  击杀 ${this.monsters.kills}  箭 ${this.arrows.count}  石头 ${this.rocks.count}  粒子 ${this.particles.count}  寻路排队 ${this.paths.pending}  寻路耗时 ${this.paths.lastFrameMs.toFixed(1)}ms\n` +
+            (this.touch
+                ? `左边摇杆: 移动   拖动: 转镜头   双指: 缩放   轻点地面/地图: 自动寻路   轻点树: 走过去砍掉`
+                : `左键点地面/地图: 自动寻路   左键点树: 走过去砍掉   F(按住): 砍面前的树   J / 空格(按住): 射箭
+WASD: 移动   滚轮: 缩放   G: 前往远方   H: 去最近的山顶   M: 大地图`);
     }
 }

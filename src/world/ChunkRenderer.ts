@@ -101,25 +101,23 @@ function shade(c: RGB, f: number): RGB {
  * - plank：桥面，木板贴图 × 顶点色
  * - granite / strata：散落的石头（Cell.Rock），花岗岩 / 层状砂岩贴图，法线投影 UV；
  *   石头格子的地面是草地，不再单独铺一层石头底图
- * - foliage / bark：树冠和灌木的叶子（树叶贴图）、树干树枝（树皮贴图），法线投影 UV
+ * - foliage / bark：蕨丛的单片叶子（树叶贴图）、树干树枝（树皮贴图），法线投影 UV
  */
 export type TerrainLayer = "base" | "grass" | "sand" | "plank" | "rock" | "gravel" | "trail" | "granite" | "strata"
     | "foliage" | "bark" | "leafcard" | "pine";
 
 /**
- * 树和灌木用的网格：叶团内核（树叶贴图）、叶簇面片（双面裁切）、松枝（双面裁切）、树干（树皮贴图）、花和果子（纯顶点色）。
+ * 树和灌木用的网格：蕨叶（树叶贴图）、叶簇面片（双面裁切）、松枝（双面裁切）、树干（树皮贴图）、花和果子（纯顶点色）。
  * far = true 是远处的块：叶簇面片数量减半（单片放大补上）、松枝切面减少、不画花和果子
  */
 interface Veg { leaf: MeshBuilder; card: MeshBuilder; pine: MeshBuilder; bark: MeshBuilder; base: MeshBuilder; far: boolean }
 
 /**
- * 一团树冠 / 灌木叶簇：里面一个偏暗的小叶团做内核（挡住视线，不会看穿），
- * 外面围一圈斜着往外、往下探出的叶簇面片（贴图里叶片以外是透明的）。
- * 轮廓是一簇簇参差的叶尖，不是一个多面体球。三角形数 = 20 + cards × 2
+ * 一团树冠 / 灌木叶簇：一圈斜着往外、往下探出的叶簇面片（贴图里叶片以外是透明的），没有实心的叶团。
+ * 轮廓是一簇簇参差的叶尖，不是一个多面体球。三角形数 = cards × 2
  */
 function crown(v: Veg, x: number, yc: number, z: number, rx: number, ry: number, rz: number,
     col: RGB, top: RGB, rand: (i: number) => number, cards: number) {
-    v.leaf.blob(x, yc, z, rx * 0.7, ry * 0.7, rz * 0.7, shade(col, 0.62), shade(col, 0.8), rand, 5);
     // 远处：面片数量减半，单片放大一些，树冠的轮廓大小不变
     const grow = v.far ? 1.3 : 1;
     if (v.far) cards = Math.ceil(cards / 2);
@@ -198,6 +196,34 @@ function underColor(kind: number): RGB {
  * 不画碎石、花和果子，叶簇面片减半，松枝切面减少
  */
 export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: number) => number, far = false): ChunkMesh[] {
+    const it = buildChunkMeshesSteps(data, kindGlobal, far);
+    for (; ;) {
+        const r = it.next();
+        if (r.done) return r.value;
+    }
+}
+
+/**
+ * 分步版的 buildChunkMeshes：每画完一行格子 yield 一次，调用方可以把一个块的构建分摊到好几帧里
+ * （树多的块构建一次要十几到几十毫秒，一帧做完会明显掉帧）。
+ * 中途放弃（调用迭代器的 return()）时，已经切分出来的 Mesh 会被销毁，不会泄漏
+ */
+export function* buildChunkMeshesSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => number,
+    far = false): Generator<void, ChunkMesh[], void> {
+    const builders: MeshBuilder[] = [];
+    let finished = false;
+    try {
+        const out = yield* buildSteps(data, kindGlobal, far, builders);
+        finished = true;
+        return out;
+    } finally {
+        if (!finished) for (const b of builders) b.discard();
+    }
+}
+
+/** buildChunkMeshesSteps 的实际实现；用到的构建器登记到 builders，中途放弃时由调用方清理 */
+function* buildSteps(data: ChunkData, kindGlobal: (gx: number, gz: number) => number, far: boolean,
+    builders: MeshBuilder[]): Generator<void, ChunkMesh[], void> {
     const mb = new MeshBuilder();
     const grass = new MeshBuilder(true);
     const sand = new MeshBuilder(true);
@@ -212,6 +238,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
     const leafcard = new MeshBuilder(true);
     const pine = new MeshBuilder(true);
     const veg: Veg = { leaf: foliage, card: leafcard, pine, bark, base: mb, far };
+    builders.push(mb, grass, sand, plank, rock, gravel, trail, granite, strata, foliage, bark, leafcard, pine);
     const gx0 = data.cx * CHUNK_CELLS, gz0 = data.cz * CHUNK_CELLS;
     granite.uvOriginX = strata.uvOriginX = foliage.uvOriginX = bark.uvOriginX = gx0 * CELL;
     granite.uvOriginZ = strata.uvOriginZ = foliage.uvOriginZ = bark.uvOriginZ = gz0 * CELL;
@@ -481,6 +508,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
         }
     };
 
+    yield;
     for (let lz = 0; lz < N; lz++) {
         for (let lx = 0; lx < N; lx++) {
             const kind = kindAt(lx, lz);
@@ -624,6 +652,7 @@ export function buildChunkMeshes(data: ChunkData, kindGlobal: (gx: number, gz: n
                 }
             }
         }
+        yield;
     }
     // 大石头由中心所在的块来画（相邻块按同样的全局规则算出同一批大石头，不会重复也不会漏）
     bigStones.ensure(gx0 * CELL, gz0 * CELL, (gx0 + N) * CELL, (gz0 + N) * CELL);
@@ -772,7 +801,7 @@ function palmChance(x: number, z: number): number {
  * 一棵树，按格子哈希从四种造型里选一种：
  * 0 松树（树干 + 五层松枝裙摆，下沿由松枝贴图裁成参差的枝梢）；1 阔叶树（主干分出三根枝，四团叶簇）；
  * 2 红叶树（浅色树干分出三根枝，五团红叶）；3 棕榈（两节弯曲的树干 + 七片弧形长叶）。
- * 叶团画在 foliage 层（树叶贴图），树干树枝画在 bark 层（树皮贴图），棕榈的长叶和果子画在 base 层（纯顶点色）。
+ * 叶簇画在 leafcard 层、松枝画在 pine 层，树干树枝画在 bark 层（树皮贴图），棕榈的长叶和果子画在 base 层（纯顶点色）。
  * 高度 4~6 米。s 是整体缩放，leaf 是基础叶色，mountain 为 true 时不出棕榈、红叶树用传入的秋色。
  * 棕榈只出现在水边，松树按低频噪声成片分布、大小不一
  */

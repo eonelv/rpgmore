@@ -17,13 +17,17 @@ export interface UnitDef {
     size: number;
     /** 生命值（主角一箭打 1 点） */
     hp: number;
+    /** 追击时在这个距离内会朝玩家扔石头（米） */
+    throwRange: number;
+    /** 两次扔石头的间隔（秒，实际会上下浮动 20%） */
+    throwCd: number;
 }
 
 export const UNIT_DEFS: Record<string, UnitDef> = {
-    imp: { name: "小恶魔（野外随机）", color: [0.85, 0.25, 0.2], chaseColor: [1, 0.05, 0.6], speed: 4, aggro: 18, leash: 32, size: 1, hp: 3 },
-    wolf: { name: "狼", color: [0.55, 0.55, 0.58], chaseColor: [0.85, 0.3, 0.3], speed: 6, aggro: 20, leash: 36, size: 0.8, hp: 3 },
-    slime: { name: "史莱姆", color: [0.3, 0.85, 0.4], chaseColor: [0.6, 1, 0.2], speed: 3, aggro: 10, leash: 20, size: 0.9, hp: 2 },
-    ghost: { name: "幽灵", color: [0.8, 0.8, 1.0], chaseColor: [0.6, 0.4, 1.0], speed: 5, aggro: 25, leash: 40, size: 1.2, hp: 5 },
+    imp: { name: "小恶魔（野外随机）", color: [0.85, 0.25, 0.2], chaseColor: [1, 0.05, 0.6], speed: 4, aggro: 18, leash: 32, size: 1, hp: 3, throwRange: 14, throwCd: 2.4 },
+    wolf: { name: "狼", color: [0.55, 0.55, 0.58], chaseColor: [0.85, 0.3, 0.3], speed: 6, aggro: 20, leash: 36, size: 0.8, hp: 3, throwRange: 10, throwCd: 2.8 },
+    slime: { name: "史莱姆", color: [0.3, 0.85, 0.4], chaseColor: [0.6, 1, 0.2], speed: 3, aggro: 10, leash: 20, size: 0.9, hp: 2, throwRange: 9, throwCd: 3.2 },
+    ghost: { name: "幽灵", color: [0.8, 0.8, 1.0], chaseColor: [0.6, 0.4, 1.0], speed: 5, aggro: 25, leash: 40, size: 1.2, hp: 5, throwRange: 16, throwCd: 2 },
 };
 
 /** 野外随机刷出的怪物种类 */
